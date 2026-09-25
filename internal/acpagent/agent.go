@@ -3,6 +3,7 @@ package acpagent
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/unreallabsai/unreal-agent/harness/llm"
 	"github.com/unreallabsai/unreal-agent/harness/session"
+	"github.com/unreallabsai/unreal-agent/harness/sessionstore"
 	"github.com/unreallabsai/unreal-agent/harness/sessionstore/localfile"
 
 	"github.com/gastownhall/acp-unreal/internal/runtime"
@@ -275,8 +277,21 @@ func (a *Agent) ResumeSession(_ context.Context, params acp.ResumeSessionRequest
 	return acp.ResumeSessionResponse{ConfigOptions: a.configOptions(r)}, nil
 }
 
-// ListSessions implements acp.Agent from the store plus meta sidecars.
+// listPageSize bounds a session/list page so its JSON-RPC line stays far
+// below gc's 1 MiB line limit.
+const listPageSize = 100
+
+// ListSessions implements acp.Agent from the store plus meta sidecars. Pages
+// are ordered by session id; the opaque cursor is the last id returned.
 func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest) (acp.ListSessionsResponse, error) {
+	after := ""
+	if params.Cursor != nil && *params.Cursor != "" {
+		raw, err := base64.RawURLEncoding.DecodeString(*params.Cursor)
+		if err != nil || !ValidSessionID(string(raw)) {
+			return acp.ListSessionsResponse{}, invalid("invalid cursor")
+		}
+		after = string(raw)
+	}
 	store, err := localfile.New(a.layout().SessionsDir())
 	if err != nil {
 		return acp.ListSessionsResponse{}, internal(err)
@@ -285,19 +300,28 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 	if err != nil && !errors.Is(err, fs.ErrNotExist) {
 		return acp.ListSessionsResponse{}, internal(err)
 	}
-	sessions := []acp.SessionInfo{}
+	slices.SortFunc(infos, func(x, y sessionstore.SessionInfo) int { return strings.Compare(string(x.ID), string(y.ID)) })
+	response := acp.ListSessionsResponse{Sessions: []acp.SessionInfo{}}
 	for _, info := range infos {
+		if string(info.ID) <= after {
+			continue
+		}
 		meta, err := a.layout().ReadMeta(info.ID)
 		if err != nil || (params.Cwd != nil && *params.Cwd != meta.Cwd) {
 			continue
 		}
+		if len(response.Sessions) == listPageSize {
+			next := base64.RawURLEncoding.EncodeToString([]byte(response.Sessions[len(response.Sessions)-1].SessionId))
+			response.NextCursor = &next
+			break
+		}
 		updated := info.LastUpdatedAt.UTC().Format(time.RFC3339)
-		sessions = append(sessions, acp.SessionInfo{
+		response.Sessions = append(response.Sessions, acp.SessionInfo{
 			SessionId: acp.SessionId(info.ID), Cwd: meta.Cwd, UpdatedAt: &updated,
 			Meta: map[string]any{"model": meta.EffectiveModel(a.cfg.DefaultModel), "createdAt": meta.CreatedAt},
 		})
 	}
-	return acp.ListSessionsResponse{Sessions: sessions}, nil
+	return response, nil
 }
 
 func (a *Agent) lookup(id acp.SessionId) (*runtime.Runtime, error) {
