@@ -99,11 +99,7 @@ func DescribeCall(call llm.ToolCall, limit int) (string, acp.ToolKind, map[strin
 		value, _ := args[key].(string)
 		return value
 	}
-	for key, value := range args {
-		if s, ok := value.(string); ok {
-			args[key] = BoundText(s, limit)
-		}
-	}
+	args = boundArgs(args, limit)
 	switch call.Name {
 	case tool.BashName:
 		command := strings.TrimSpace(text("command"))
@@ -121,6 +117,30 @@ func DescribeCall(call llm.ToolCall, limit int) (string, acp.ToolKind, map[strin
 	default:
 		return call.Name, acp.ToolKindOther, args
 	}
+}
+
+// boundArgs keeps rawInput within about limit bytes of JSON however the
+// size is distributed: top-level strings are bounded individually, and if
+// the whole object is still too large (deep nesting, huge arrays) it is
+// replaced by a bounded JSON preview plus the command.
+func boundArgs(args map[string]any, limit int) map[string]any {
+	if limit <= 0 || args == nil {
+		return args
+	}
+	for key, value := range args {
+		if s, ok := value.(string); ok {
+			args[key] = BoundText(s, limit)
+		}
+	}
+	encoded, err := json.Marshal(args)
+	if err != nil || len(encoded) <= limit {
+		return args
+	}
+	bounded := map[string]any{"truncated": true, "json": BoundText(string(encoded), limit/2)}
+	if command, ok := args["command"].(string); ok {
+		bounded["command"] = BoundText(command, limit/2)
+	}
+	return bounded
 }
 
 // ToolCallStart is the pending tool_call announcing call.
