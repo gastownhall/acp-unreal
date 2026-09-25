@@ -426,26 +426,65 @@ func TestE8bClientDeathLeavesNoOrphans(t *testing.T) {
 	}
 }
 
-// E9: targeted env scrub: the API key is gone, GC_* is kept.
-func TestE9EnvScrubKeepsGCVars(t *testing.T) {
+// E9: credential scrub. Tools can read their own environment AND their
+// parent's /proc/<pid>/environ (the exec-time block, which os.Unsetenv does
+// not change), so the agent re-execs itself with a scrubbed environment and
+// receives the key over an inherited pipe. GC_* is kept.
+func TestE9CredentialScrubCoversOwnAndParentEnviron(t *testing.T) {
 	llm := newFakeLLM(t)
 	state, ws := newDirs(t)
-	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: []string{"ACP_UNREAL_API_KEY=dummy-not-secret", "GC_SESSION_ID=gc-test", "OPENAI_API_KEY=dummy-2"}})
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: []string{
+		"ACP_UNREAL_API_KEY=dummy-key-A", "OPENAI_API_KEY=dummy-key-B", "OLLAMA_API_KEY2=dummy-key-C",
+		"GC_SESSION_ID=gc-test", "GC_INSTANCE_TOKEN=gc-tok-kept",
+	}})
 	a.initialize()
 	sid := a.newSession()
-	a.prompt(sid, "RUN[printenv ACP_UNREAL_API_KEY || echo absent; printenv OPENAI_API_KEY || echo absent2; printenv GC_SESSION_ID]")
+	a.prompt(sid, `RUN[echo own=$(env | grep -c dummy-key) parent=$(tr '\0' '\n' </proc/$PPID/environ | grep -c dummy-key) $GC_INSTANCE_TOKEN]`)
 	trace := toolTrace(a.client.snapshot())
 	if len(trace) != 3 {
 		t.Fatalf("trace = %q", trace)
 	}
-	out := trace[2]
-	if !strings.Contains(out, "absent") || !strings.Contains(out, "absent2") || !strings.Contains(out, "gc-test") || strings.Contains(out, "dummy") {
+	if out := trace[2]; !strings.Contains(out, "own=0 parent=0 gc-tok-kept") {
 		t.Fatalf("tool output = %q", out)
 	}
-	if got := llm.Requests()[0].Authorization; got != "Bearer dummy-not-secret" {
-		t.Fatal("the provider did not receive the key read before the scrub")
+	if n := environHits(t, a.cmd.Process.Pid, "dummy-key"); n != 0 {
+		t.Fatalf("/proc/<agent>/environ still holds %d credential values", n)
+	}
+	if got := llm.Requests()[0].Authorization; got != "Bearer dummy-key-A" {
+		t.Fatal("the provider did not receive the key passed across the re-exec")
 	}
 	a.stop()
+}
+
+// E9b: --api-key-file keeps the key out of every environment; a key file
+// readable by group or others is refused.
+func TestE9bAPIKeyFile(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	keyFile := filepath.Join(filepath.Dir(state), "key")
+	if err := os.WriteFile(keyFile, []byte("dummy-file-key\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, args: []string{"--api-key-file", keyFile}})
+	a.initialize()
+	sid := a.newSession()
+	a.prompt(sid, "hello")
+	if got := llm.Requests()[0].Authorization; got != "Bearer dummy-file-key" {
+		t.Fatal("the provider did not receive the key from --api-key-file")
+	}
+	if n := environHits(t, a.cmd.Process.Pid, "dummy-file-key"); n != 0 {
+		t.Fatalf("key from file leaked into the environment (%d hits)", n)
+	}
+	a.stop()
+
+	if err := os.Chmod(keyFile, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	b := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, args: []string{"--api-key-file", keyFile}})
+	b.waitExit(5 * time.Second)
+	if code := b.cmd.ProcessState.ExitCode(); code != 2 || !strings.Contains(b.stderr.String(), "--api-key-file") {
+		t.Fatalf("world-readable key file: exit %d stderr %q", code, b.stderr.String())
+	}
 }
 
 // E10: huge tool output and a huge prompt still yield only JSON-RPC lines

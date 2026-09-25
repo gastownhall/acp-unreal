@@ -512,6 +512,16 @@ func markedProcs(marker string, exclude int) []procInfo {
 	return out
 }
 
+// environHits counts occurrences of needle in /proc/<pid>/environ.
+func environHits(t *testing.T, pid int, needle string) int {
+	t.Helper()
+	env, err := os.ReadFile(fmt.Sprintf("/proc/%d/environ", pid))
+	if err != nil {
+		t.Fatalf("read environ of %d: %v", pid, err)
+	}
+	return bytes.Count(env, []byte(needle))
+}
+
 // liveInGroup lists live (non-zombie) members of process group pgid.
 func liveInGroup(pgid int) []procInfo {
 	entries, _ := os.ReadDir("/proc")

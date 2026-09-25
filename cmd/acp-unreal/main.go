@@ -33,12 +33,6 @@ const (
 	exitUnknownSession = 3
 )
 
-// scrubbedCredentialVars are removed from the process environment after the
-// key is read: Bash children inherit the full environment
-// (operation/shell.go:519-532, primitives/process.go:608). GC_* and BEADS_*
-// are deliberately kept -- the agent's tools legitimately need them.
-var scrubbedCredentialVars = []string{"UNREAL_HARNESS_LLM_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_API_KEY"}
-
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
 		return v
@@ -65,11 +59,11 @@ func splitCSV(s string) []string {
 }
 
 type options struct {
-	baseURL, model, models, apiKeyEnv, stateDir, permissionMode, allow, shell, systemPrompt string
-	sessionID, resume                                                                       string
-	permissionTimeout, cancelGrace, shutdownBudget, opTimeout                               time.Duration
-	contextWindow, maxUpdateText, maxAttempts                                               int
-	promptCacheKey                                                                          bool
+	baseURL, model, models, apiKeyEnv, apiKeyFile, scrubEnv, keepEnv, stateDir, permissionMode, allow, shell, systemPrompt string
+	sessionID, resume                                                                                                      string
+	permissionTimeout, cancelGrace, shutdownBudget, opTimeout                                                              time.Duration
+	contextWindow, maxUpdateText, maxAttempts                                                                              int
+	promptCacheKey                                                                                                         bool
 }
 
 func parseFlags() options {
@@ -77,7 +71,10 @@ func parseFlags() options {
 	flag.StringVar(&o.baseURL, "base-url", os.Getenv("ACP_UNREAL_BASE_URL"), "OpenAI Responses-compatible base URL (env ACP_UNREAL_BASE_URL)")
 	flag.StringVar(&o.model, "model", os.Getenv("ACP_UNREAL_MODEL"), "default model id (env ACP_UNREAL_MODEL)")
 	flag.StringVar(&o.models, "models", "", "comma-separated models offered as the model config option")
-	flag.StringVar(&o.apiKeyEnv, "api-key-env", "ACP_UNREAL_API_KEY", "NAME of the env var holding the provider API key (read, then unset)")
+	flag.StringVar(&o.apiKeyEnv, "api-key-env", "ACP_UNREAL_API_KEY", "NAME of the env var holding the provider API key (read, then scrubbed)")
+	flag.StringVar(&o.apiKeyFile, "api-key-file", "", "read the provider API key from this file (mode 0600); the key never enters any environment")
+	flag.StringVar(&o.scrubEnv, "scrub-env", "", "comma-separated extra variable names removed from the environment tools inherit")
+	flag.StringVar(&o.keepEnv, "keep-env", "", "comma-separated variable names kept even though their names look like credentials")
 	flag.StringVar(&o.stateDir, "state-dir", defaultStateDir(), "session store, meta, locks and tool output; must be outside the workspace")
 	flag.StringVar(&o.permissionMode, "permission-mode", "auto", "auto | ask | allowlist")
 	flag.StringVar(&o.allow, "allow", "", "comma-separated command prefixes auto-allowed in allowlist mode")
@@ -112,13 +109,15 @@ func run() int {
 	o := parseFlags()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
-	apiKey := os.Getenv(o.apiKeyEnv)
-	for _, name := range append([]string{o.apiKeyEnv}, scrubbedCredentialVars...) {
-		_ = os.Unsetenv(name)
-	}
 	usage := func(format string, args ...any) int {
 		fmt.Fprintf(os.Stderr, "acp-unreal: "+format+"\n", args...)
 		return exitUsage
+	}
+	// Tools inherit this process's environment (operation/shell.go:519-532,
+	// primitives/process.go:608) and can read /proc/$PPID/environ.
+	apiKey, err := loadAPIKey(o)
+	if err != nil {
+		return usage("%v", err)
 	}
 	if o.baseURL == "" || o.model == "" {
 		return usage("--base-url and --model (or ACP_UNREAL_BASE_URL / ACP_UNREAL_MODEL) are required")
