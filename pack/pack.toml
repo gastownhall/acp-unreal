@@ -3,8 +3,8 @@
 # Import it from a city or pack:
 #
 #   [imports.acp-unreal]
-#   source = "https://github.com/gastownhall/acp-unreal/tree/v0.1.0/pack"
-#   version = "sha:<commit of v0.1.0>"
+#   source = "https://github.com/gastownhall/acp-unreal/tree/v0.1.1/pack"
+#   version = "sha:<commit of v0.1.1>"
 #
 # or from a local checkout:
 #
@@ -12,7 +12,7 @@
 #   source = "/path/to/acp-unreal/pack"
 #
 # The acp-unreal binary must be on the controller's PATH:
-#   go install github.com/gastownhall/acp-unreal/cmd/acp-unreal@v0.1.0
+#   go install github.com/gastownhall/acp-unreal/cmd/acp-unreal@v0.1.1
 
 [pack]
 name = "acp-unreal"
@@ -28,6 +28,10 @@ supports_acp = true
 # environment (acp-unreal scrubs its own).
 acp_command = "exec acp-unreal"
 acp_args = ["--shutdown-budget", "4s"]
+# Prompts travel only over ACP. With the default prompt_mode ("arg") gc would
+# append a session's initial message to the launch command, where it is lost;
+# "none" makes gc deliver it as the first session/prompt instead.
+prompt_mode = "none"
 # No session_id_flag / resume_flag: acp-unreal binds each gc session to
 # GC_SESSION_ID + GC_CONTINUATION_EPOCH, so a restart resumes the
 # conversation and `gc session reset` starts a fresh one.
@@ -68,5 +72,40 @@ flag_args = ["--permission-mode", "ask"]
 
 [[providers.unreal.options_schema.choices]]
 value = "allowlist"
-label = "Ask unless allowlisted (--allow)"
+label = "Ask unless allowlisted (see Allowed commands)"
 flag_args = ["--permission-mode", "allowlist"]
+
+# Command prefixes that "allowlist" runs without asking, comma-separated
+# (for example "go test,git status"). Open option: any value is passed.
+[[providers.unreal.options_schema]]
+key = "allow"
+label = "Allowed commands (allowlist mode)"
+type = "select"
+default = ""
+flag_template = ["--allow", "{value}"]
+
+[[providers.unreal.options_schema.choices]]
+value = ""
+label = "None"
+flag_args = []
+
+# How long "ask" and "allowlist" wait for an answer to session/request_permission
+# before rejecting the command. A gc that does not serve permission requests
+# never answers, so the default is finite; "0" waits forever. Open option: any
+# Go duration is passed.
+[[providers.unreal.options_schema]]
+key = "permission_timeout"
+label = "Permission request timeout"
+type = "select"
+default = "10m"
+flag_template = ["--permission-timeout", "{value}"]
+
+[[providers.unreal.options_schema.choices]]
+value = "10m"
+label = "10 minutes"
+flag_args = ["--permission-timeout", "10m"]
+
+[[providers.unreal.options_schema.choices]]
+value = "0"
+label = "Wait forever (needs a gc that answers permission requests)"
+flag_args = ["--permission-timeout", "0"]

@@ -141,6 +141,12 @@ func run() int {
 	}
 	// Tools inherit this process's environment (operation/shell.go:519-532,
 	// primitives/process.go:608) and can read /proc/$PPID/environ.
+	// Prompts arrive only over ACP. gc appends a session's initial message
+	// to the command when the provider's prompt_mode is "arg" (the pack sets
+	// "none"); refusing it beats dropping the message silently.
+	if flag.NArg() > 0 {
+		return usage("unexpected positional arguments (%d); prompts are sent over ACP session/prompt. Under gc, set prompt_mode = \"none\" on the provider", flag.NArg())
+	}
 	apiKey, err := loadAPIKey(o)
 	if err != nil {
 		return usage("%v", err)

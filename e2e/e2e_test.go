@@ -523,3 +523,16 @@ func TestE10StdoutLinesBounded(t *testing.T) {
 	}
 	b.stop()
 }
+
+// gc appends a session's initial message to the launch command when the
+// provider's prompt_mode is "arg". acp-unreal takes prompts only over ACP, so
+// a positional argument is a usage error, never silently dropped.
+func TestPositionalArgumentsAreRefused(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, args: []string{"Please fix the failing test"}})
+	a.waitExit(5 * time.Second)
+	if code := a.cmd.ProcessState.ExitCode(); code != 2 || !strings.Contains(a.stderr.String(), "positional") {
+		t.Fatalf("positional argument: exit %d stderr %q", code, a.stderr.String())
+	}
+}

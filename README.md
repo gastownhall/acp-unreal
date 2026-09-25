@@ -224,8 +224,16 @@ This repository ships a gc pack, [`pack/pack.toml`](pack/pack.toml), which decla
 - `supports_acp = true`, `acp_command = "exec acp-unreal"` (see the security model).
 - `upstream_env` maps an agent upstream's `base_url` and `api_key` onto
   `ACP_UNREAL_BASE_URL` and `ACP_UNREAL_API_KEY`.
-- Options: `model` (open: any id is passed as `--model <id>`, default `gpt-oss:120b`)
-  and `permission_mode` (`auto`, `ask`, `allowlist`).
+- `prompt_mode = "none"`: prompts travel only over ACP. gc delivers a session's
+  initial message as the first `session/prompt`. `acp-unreal` refuses positional
+  arguments (exit 2), so a message appended to the command is never dropped silently.
+- Options: `model` (open: any id is passed as `--model <id>`, default `gpt-oss:120b`),
+  `permission_mode` (`auto`, `ask`, `allowlist`), `allow` (open: the comma-separated
+  prefixes passed as `--allow`, used by `allowlist`) and `permission_timeout` (open: a
+  Go duration, default `10m`; `0` waits forever). A gc that does not answer
+  `session/request_permission` would leave an `ask` or `allowlist` turn waiting
+  forever, which is why the default timeout is finite: when it expires the command
+  is rejected and the turn goes on.
 - No `session_id_flag` or `resume_flag`: [bound mode](#bound-mode) keys the
   conversation on `GC_SESSION_ID` and `GC_CONTINUATION_EPOCH`.
 
