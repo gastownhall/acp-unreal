@@ -4,7 +4,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -25,8 +24,8 @@ import (
 	"github.com/unreallabsai/unreal-agent/harness/primitives"
 
 	"github.com/gastownhall/acp-unreal/internal/acpagent"
-	"github.com/gastownhall/acp-unreal/internal/reaper"
 	"github.com/gastownhall/acp-unreal/internal/runtime"
+	"github.com/gastownhall/acp-unreal/internal/sweep"
 	"github.com/gastownhall/acp-unreal/internal/tap"
 )
 
@@ -50,6 +49,10 @@ const (
 	exitUsage          = 2
 	exitUnknownSession = 3
 )
+
+// sweepGrace is how long escaped tool descendants get between SIGTERM and
+// SIGKILL at shutdown; it runs after the shutdown budget, inside gc's 5s.
+const sweepGrace = 500 * time.Millisecond
 
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
@@ -209,18 +212,16 @@ func run() int {
 		DefaultModel: o.model, Models: splitCSV(o.models), Bound: bound,
 		ShutdownBudget: o.shutdownBudget, Version: buildVersion(),
 	})
-	// Descendants that detach with setsid are re-parented here instead of
-	// to init, reaped as they exit, and killed at shutdown.
-	if err := reaper.Enable(); err != nil {
-		logger.Warn("child subreaper unavailable; setsid-detached tool descendants can outlive the agent", "err", err)
+	// Descendants that escape their tool's process group (setsid daemons)
+	// are found by an inherited environment marker and stopped at shutdown.
+	marker, err := sweep.Mark()
+	if err != nil {
+		logger.Error("mark tool descendants", "err", err)
+		return 1
 	}
-	reaperCtx, stopReaper := context.WithCancel(context.Background())
-	defer stopReaper()
-	go reaper.Run(reaperCtx)
 	shutdown := func() {
 		agent.Shutdown()
-		stopReaper()
-		reaper.KillDescendants(logger)
+		marker.Stop(logger, sweepGrace)
 	}
 	// The SDK logs via slog.Default() when no logger is set. Connection.
 	// SetLogger is unsynchronized with the reader goroutine the constructor

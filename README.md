@@ -22,7 +22,7 @@ acp-unreal --version
 ```
 
 Go 1.27 or newer is required (`GOTOOLCHAIN=auto` downloads it). The process-hygiene
-features (subreaper, `/proc` checks) are Linux-only; see [Limitations](#limitations).
+features (the detached-descendant sweep, `/proc` checks) are Linux-only; see [Limitations](#limitations).
 
 Minimal run against any Responses-compatible endpoint:
 
@@ -167,12 +167,26 @@ answer the cancelled calls are muted.
 | event | effect |
 |---|---|
 | SIGINT | cancel every active turn; the process stays up (this is gc's cooperative interrupt) |
-| SIGTERM, SIGHUP, stdin EOF | graceful shutdown within `--shutdown-budget`: cancel turns, stop the coordinators, drain the tools, SIGKILL any remaining tool process groups and detached descendants, exit 0 |
+| SIGTERM, SIGHUP, stdin EOF | graceful shutdown within `--shutdown-budget`: cancel turns, stop the coordinators, drain the tools, SIGKILL any remaining tool process groups, stop detached descendants (below), exit 0 |
 | client death (stdin EOF with stdout and stderr broken) | the same graceful shutdown. SIGPIPE is caught, so writes fail with `EPIPE` instead of killing the process before it cleans up |
 
-`acp-unreal` is a child subreaper (Linux `PR_SET_CHILD_SUBREAPER`). A tool descendant
-that detaches with `setsid` (a daemon, `tmux new -d`) is re-parented to `acp-unreal`
-instead of init, reaped when it exits, and killed at shutdown.
+**Which descendants are stopped.** Every process `acp-unreal` starts inherits
+`ACP_UNREAL_OWNERS`, a colon-separated list that includes a random token of this
+`acp-unreal` process. A tool descendant that leaves its tool's process group (a
+`setsid` daemon, `tmux new -d`) is not in a group `acp-unreal` kills, so at shutdown
+`acp-unreal` scans `/proc` (Linux) for live processes whose environment carries its
+token and, when `GC_SESSION_ID` is set, the same `GC_SESSION_ID`. Each one gets
+SIGTERM, then SIGKILL if it is still running 500ms later. Single processes are
+signalled, never whole process groups.
+
+This is the same rule gc's session orphan sweep uses. gc removes `GC_SESSION_ID` from
+the city infrastructure it detaches on purpose (a supervisor respawned by `gc start`,
+the managed Dolt server and its watchdog), so a tool that starts those does not get
+them killed when the agent stops. Outside gc there is no such hand-off: a process a
+tool detached on purpose is stopped unless it drops `ACP_UNREAL_OWNERS` from its
+environment. A process that clears its environment (`env -i`) is not found.
+`acp-unreal` is not a subreaper, so detached descendants are re-parented to init (or
+the nearest subreaper) and never become zombies of `acp-unreal`.
 
 If `acp-unreal` itself is SIGKILLed, running tools survive in their own process
 groups. They carry `GC_SESSION_ID`, so under gc the orphan sweep can reap them.
@@ -279,12 +293,9 @@ add `--permission-mode ask` to the agent command line to be asked.
 - **No per-operation output cap.** The library captures full tool output to files in
   the state dir. What reaches the client and the model is bounded, but disk use is not.
 - **No `session/set_mode`.** Permission modes are launch flags.
-- **Linux for process hygiene.** The subreaper, the reaping of detached descendants
+- **Linux for detached descendants.** Finding detached descendants reads `/proc`,
   and the e2e tests need Linux. On other platforms tool process groups are still
   killed, but `setsid`-detached descendants can outlive the agent.
-- **Descendants the subreaper cannot see.** A descendant that detaches into a session
-  whose members are all children of a process that is still alive is not found until
-  that process exits.
 
 ## Troubleshooting
 
@@ -315,8 +326,8 @@ Layout:
 - `internal/gate`, `tap`, `ops`, `mirror`, `project`, `fifo`: the model-adapter
   decorator, the SSE delta tee, the operation-manager decorator, the scheduling mirror,
   the ACP projection and a queue.
-- `internal/credenv`, `internal/reaper`: the credential scrub policy and the child
-  subreaper.
+- `internal/credenv`, `internal/sweep`: the credential scrub policy and the
+  shutdown sweep of detached descendants.
 - `internal/testfake/responses`: a scripted fake of the Responses API (`cmd/` serves it
   for manual smoke tests).
 - `e2e/`: subprocess tests.

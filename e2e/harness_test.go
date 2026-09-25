@@ -621,3 +621,25 @@ func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
 }
+
+// cmdline returns pid's argv joined by spaces ("" if it is gone).
+func cmdline(pid int) string {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(strings.ReplaceAll(string(data), "\x00", " "))
+}
+
+// liveProc reports whether pid exists and is not a zombie.
+func liveProc(pid int) bool {
+	info, ok := readStat(pid)
+	return ok && info.state != "Z"
+}
+
+// waitGone waits up to 2s for pid to stop being a live process.
+func waitGone(pid int) {
+	for i := 0; i < 100 && liveProc(pid); i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+}

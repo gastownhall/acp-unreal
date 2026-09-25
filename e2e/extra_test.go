@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"fmt"
+	"path/filepath"
 	"syscall"
 	"uuid"
 
@@ -462,36 +464,81 @@ func TestBoundRestartAnnouncesInterruptedCallAndHidesStatePaths(t *testing.T) {
 
 // A tool can detach a descendant with setsid (daemons, tmux new -d); it
 // escapes both the library's group SIGTERM and the agent's pgid SIGKILL.
-// The agent is a child subreaper, so the escapee is re-parented to it, and
-// shutdown kills it.
-func TestShutdownKillsSetsidEscapedDescendants(t *testing.T) {
+// Shutdown finds it by the environment marker every tool inherits, sends
+// SIGTERM, and SIGKILLs what ignores it after a short grace.
+func TestShutdownStopsSetsidEscapedDescendants(t *testing.T) {
 	llm := newFakeLLM(t)
 	state, ws := newDirs(t)
 	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
 	a.initialize()
 	sid := a.newSession()
-	a.prompt(sid, `RUN[setsid sleep 64 >/dev/null 2>&1 < /dev/null & sleep 0.5; echo launched]`)
-	var escapee procInfo
-	waitFor(t, 5*time.Second, "setsid escapee running", func() bool {
+	a.prompt(sid, `RUN[setsid sh -c 'trap "touch term-seen; exit 0" TERM; sleep 64 & wait' >/dev/null 2>&1 < /dev/null & setsid sh -c 'trap "" TERM; sleep 65' >/dev/null 2>&1 < /dev/null & sleep 0.5; echo launched]`)
+	waitFor(t, 5*time.Second, "setsid escapees running", func() bool {
+		sleeps := 0
 		for _, p := range markedProcs(a.opts.marker, a.cmd.Process.Pid) {
 			if p.comm == "sleep" {
-				escapee = p
-				return true
+				sleeps++
 			}
 		}
-		return false
+		return sleeps == 2
 	})
-	if ppid := parentPID(escapee.pid); ppid != a.cmd.Process.Pid {
-		t.Fatalf("escapee ppid = %d, want the agent %d (child subreaper)", ppid, a.cmd.Process.Pid)
-	}
-	// An adopted escapee that exits is reaped, not left a zombie.
-	a.prompt(sid, `RUN[setsid sleep 1 >/dev/null 2>&1 < /dev/null & sleep 0.3; echo launched]`)
-	waitFor(t, 5*time.Second, "second escapee adopted", func() bool { return len(markedProcs(a.opts.marker, a.cmd.Process.Pid)) == 2 })
-	waitFor(t, 5*time.Second, "second escapee exited", func() bool { return len(markedProcs(a.opts.marker, a.cmd.Process.Pid)) == 1 })
+	// An escapee that exits on its own is not left a zombie of the agent.
+	a.prompt(sid, `RUN[setsid sleep 0.2 >/dev/null 2>&1 < /dev/null & sleep 0.5; echo launched]`)
 	time.Sleep(200 * time.Millisecond)
 	if n := zombieChildren(a.cmd.Process.Pid); n != 0 {
-		t.Fatalf("%d exited escapees left as zombies", n)
+		t.Fatalf("%d exited escapees left as zombies of the agent", n)
 	}
 	a.stop()
-	waitFor(t, 2*time.Second, "escapee killed", func() bool { return len(markedProcs(a.opts.marker, -1)) == 0 })
+	waitFor(t, 3*time.Second, "escapees stopped", func() bool { return len(markedProcs(a.opts.marker, -1)) == 0 })
+	if !exists(filepath.Join(ws, "term-seen")) {
+		t.Fatal("the escapee got no SIGTERM before SIGKILL")
+	}
+	if !strings.Contains(a.stderr.String(), "killed leftover descendant") {
+		t.Fatal("the TERM-ignoring escapee was not SIGKILLed after the grace")
+	}
+}
+
+// gc detaches some processes a tool starts on purpose so they outlive the
+// agent: a supervisor respawned by `gc start` and the managed Dolt server
+// with its watchdog. gc strips GC_SESSION_ID from them. The agent must not
+// adopt them, leave them as zombies, or kill them at shutdown; a leftover
+// that still carries the session's GC_SESSION_ID is stopped.
+func TestShutdownSparesDetachedCityInfrastructure(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: []string{"GC_SESSION_ID=infra-s", "GC_CONTINUATION_EPOCH=1"}})
+	a.initialize()
+	sid := a.newSession()
+	infraSpawn := `env -u GC_SESSION_ID python3 -c "import os,subprocess; subprocess.Popen(['sleep','%s'], preexec_fn=os.setpgrp, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)"`
+	// A short-lived one exits while the agent runs.
+	a.prompt(sid, "RUN["+fmt.Sprintf(infraSpawn, "0.2")+"; sleep 0.6; echo spawned]")
+	time.Sleep(200 * time.Millisecond)
+	if n := zombieChildren(a.cmd.Process.Pid); n != 0 {
+		t.Fatalf("%d exited infrastructure processes left as zombies of the agent", n)
+	}
+	a.prompt(sid, "RUN["+fmt.Sprintf(infraSpawn, "300")+`; setsid sleep 301 >/dev/null 2>&1 < /dev/null & sleep 0.5; echo spawned]`)
+	var infra, leftover procInfo
+	waitFor(t, 5*time.Second, "infrastructure and leftover running", func() bool {
+		for _, p := range markedProcs(a.opts.marker, a.cmd.Process.Pid) {
+			switch cmdline(p.pid) {
+			case "sleep 300":
+				infra = p
+			case "sleep 301":
+				leftover = p
+			}
+		}
+		return infra.pid != 0 && leftover.pid != 0
+	})
+	t.Cleanup(func() { _ = syscall.Kill(infra.pid, syscall.SIGKILL); waitGone(infra.pid) })
+	if ppid := parentPID(infra.pid); ppid == a.cmd.Process.Pid {
+		t.Fatalf("infrastructure pid %d was adopted by the agent", infra.pid)
+	}
+	a.stop()
+	waitFor(t, 3*time.Second, "leftover stopped", func() bool { return !liveProc(leftover.pid) })
+	time.Sleep(300 * time.Millisecond)
+	if !liveProc(infra.pid) {
+		t.Fatal("detached city infrastructure was killed at agent shutdown")
+	}
+	_ = syscall.Kill(infra.pid, syscall.SIGKILL)
+	waitGone(infra.pid)
 }
