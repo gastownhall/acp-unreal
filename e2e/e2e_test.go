@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -439,12 +440,12 @@ func TestE9CredentialScrubCoversOwnAndParentEnviron(t *testing.T) {
 	}})
 	a.initialize()
 	sid := a.newSession()
-	a.prompt(sid, `RUN[echo own=$(env | grep -c dummy-key) parent=$(tr '\0' '\n' </proc/$PPID/environ | grep -c dummy-key) $GC_INSTANCE_TOKEN]`)
+	a.prompt(sid, `RUN[echo own=$(env | grep -c dummy-key) parent=$(tr '\0' '\n' </proc/$PPID/environ | grep -c dummy-key) $GC_INSTANCE_TOKEN pp=$ACP_UNREAL_PARENT_PID]`)
 	trace := toolTrace(a.client.snapshot())
 	if len(trace) != 3 {
 		t.Fatalf("trace = %q", trace)
 	}
-	if out := trace[2]; !strings.Contains(out, "own=0 parent=0 gc-tok-kept") {
+	if out := trace[2]; !strings.Contains(out, fmt.Sprintf("own=0 parent=0 gc-tok-kept pp=%d", a.cmd.Process.Pid)) {
 		t.Fatalf("tool output = %q", out)
 	}
 	if n := environHits(t, a.cmd.Process.Pid, "dummy-key"); n != 0 {

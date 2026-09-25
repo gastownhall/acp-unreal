@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -148,6 +149,12 @@ func run() int {
 	bound, err := acpagent.ResolveBound(os.Getenv, o.sessionID, o.resume)
 	if err != nil {
 		return usage("%v", err)
+	}
+	// Mark every tool this process starts, so a nested acp-unreal does not
+	// bind to this process's inherited gc session.
+	if err := os.Setenv(acpagent.ParentPIDEnv, strconv.Itoa(os.Getpid())); err != nil {
+		logger.Error("export "+acpagent.ParentPIDEnv, "err", err)
+		return 1
 	}
 	if bound.Mode == acpagent.BoundResume && !layout.Exists(bound.ID) {
 		fmt.Fprintf(os.Stderr, "acp-unreal: unknown session %s\n", bound.ID)

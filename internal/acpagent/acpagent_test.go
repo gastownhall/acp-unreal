@@ -95,3 +95,19 @@ func TestInsideDir(t *testing.T) {
 		}
 	}
 }
+
+// A nested acp-unreal started by one of this agent's tools inherits
+// GC_SESSION_ID; binding to it would collide with the parent ("session
+// busy"). The parent marks its tools with ParentPIDEnv, and a marked
+// process ignores the ambient gc identity.
+func TestResolveBoundIgnoresAmbientGCIdentityUnderAParentAgent(t *testing.T) {
+	nested := env(map[string]string{"GC_SESSION_ID": "s1", "GC_CONTINUATION_EPOCH": "2", ParentPIDEnv: "4242"})
+	b, err := ResolveBound(nested, "", "")
+	if err != nil || b.Mode != Unbound {
+		t.Fatalf("nested agent bound to the parent's gc session: %+v %v", b, err)
+	}
+	b, _ = ResolveBound(nested, "K", "")
+	if b.Mode != BoundCreate || b.ID != "K" {
+		t.Fatalf("explicit --session-id must still apply: %+v", b)
+	}
+}
