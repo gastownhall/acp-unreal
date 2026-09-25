@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  schedule:
+    # Weekly drift check against the newest unreal-agent release.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  GOFLAGS: -mod=readonly
+
+jobs:
+  test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed:"; echo "$unformatted"; exit 1
+          fi
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./... -count=1
+      - name: go test -race
+        run: go test -race ./... -count=1
+      - name: race e2e (race-instrumented agent binary)
+        env:
+          ACP_UNREAL_E2E_RACE: "1"
+        run: go test -race ./e2e/ -count=3
+
+  contract:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: unreal-agent is pinned to v0.1.1
+        run: |
+          got="$(go list -m -f '{{.Version}}' github.com/unreallabsai/unreal-agent)"
+          echo "unreal-agent $got"
+          test "$got" = "v0.1.1"
+      - name: library contract tests
+        run: go test ./internal/runtime/ -run '^TestContract' -count=1 -v
+
+  unreal-agent-latest:
+    # Non-blocking early warning: does the newest unreal-agent still satisfy
+    # the contracts? Failures here never gate a merge or a release.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    env:
+      GOFLAGS: -mod=mod
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+      - name: upgrade unreal-agent to latest
+        run: |
+          go get github.com/unreallabsai/unreal-agent@latest
+          go list -m github.com/unreallabsai/unreal-agent
+      - name: build, contract and full tests
+        run: |
+          go build ./...
+          go test ./internal/runtime/ -run '^TestContract' -count=1 -v
+          go test ./... -count=1

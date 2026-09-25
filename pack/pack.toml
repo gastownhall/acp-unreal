@@ -1,0 +1,72 @@
+# acp-unreal — Gas City pack declaring the "unreal" provider.
+#
+# Import it from a city or pack:
+#
+#   [imports.acp-unreal]
+#   source = "https://github.com/gastownhall/acp-unreal/tree/v0.1.0/pack"
+#   version = "sha:<commit of v0.1.0>"
+#
+# or from a local checkout:
+#
+#   [imports.acp-unreal]
+#   source = "/path/to/acp-unreal/pack"
+#
+# The acp-unreal binary must be on the controller's PATH:
+#   go install github.com/gastownhall/acp-unreal/cmd/acp-unreal@v0.1.0
+
+[pack]
+name = "acp-unreal"
+schema = 2
+
+[providers.unreal]
+display_name = "Unreal Agent (acp-unreal)"
+command = "acp-unreal"
+path_check = "acp-unreal"
+supports_acp = true
+# gc runs the command through `sh -c`. `exec` replaces that shell with
+# acp-unreal, so no wrapper process keeps the serving credential in its
+# environment (acp-unreal scrubs its own).
+acp_command = "exec acp-unreal"
+acp_args = ["--shutdown-budget", "4s"]
+# No session_id_flag / resume_flag: acp-unreal binds each gc session to
+# GC_SESSION_ID + GC_CONTINUATION_EPOCH, so a restart resumes the
+# conversation and `gc session reset` starts a fresh one.
+
+# An agent's upstream renders its base_url and api_key onto these variables.
+[providers.unreal.upstream_env]
+base_url = "ACP_UNREAL_BASE_URL"
+api_key = "ACP_UNREAL_API_KEY"
+
+[[providers.unreal.options_schema]]
+key = "model"
+label = "Model"
+type = "select"
+default = "gpt-oss:120b"
+# Open option: any model id the upstream serves is passed through.
+flag_template = ["--model", "{value}"]
+
+[[providers.unreal.options_schema.choices]]
+value = "gpt-oss:120b"
+label = "gpt-oss 120B"
+flag_args = ["--model", "gpt-oss:120b"]
+
+[[providers.unreal.options_schema]]
+key = "permission_mode"
+label = "Tool permissions"
+type = "select"
+default = "auto"
+
+[[providers.unreal.options_schema.choices]]
+value = "auto"
+label = "Run tools without asking"
+flag_args = ["--permission-mode", "auto"]
+
+[[providers.unreal.options_schema.choices]]
+value = "ask"
+label = "Ask before every command"
+flag_args = ["--permission-mode", "ask"]
+
+[[providers.unreal.options_schema.choices]]
+value = "allowlist"
+label = "Ask unless allowlisted (--allow)"
+flag_args = ["--permission-mode", "allowlist"]

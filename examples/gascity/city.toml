@@ -1,0 +1,24 @@
+# Minimal Gas City city running one Unreal Agent session over ACP.
+#
+#   export OLLAMA_API_KEY=...            # read by the controller, never inlined
+#   gc start                             # from this directory
+#
+# Replace the import source with the released pack or your checkout path.
+
+[workspace]
+name = "unreal-demo"
+
+[imports.acp-unreal]
+source = "../../pack"
+
+# A model-serving endpoint. api_key is a $VAR reference expanded by the
+# controller, so the secret never appears in config.
+[upstreams.ollama]
+base_url = "https://ollama.com/v1"
+api_key = "$OLLAMA_API_KEY"
+
+[[agent]]
+name = "unreal"
+provider = "unreal"
+session = "acp"
+upstream = "ollama"
