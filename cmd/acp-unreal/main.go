@@ -11,6 +11,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"regexp"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"syscall"
@@ -28,7 +30,20 @@ import (
 	"github.com/gastownhall/acp-unreal/internal/tap"
 )
 
-const version = "0.1.0-spike"
+// version is the release; `go install ...@vX.Y.Z` builds report the module
+// version instead (see buildVersion).
+const version = "0.1.0"
+
+// releaseVersion matches a tagged module version (not a VCS pseudo-version).
+var releaseVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)
+
+// buildVersion prefers the release version stamped by go install @vX.Y.Z.
+func buildVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok && releaseVersion.MatchString(info.Main.Version) {
+		return strings.TrimPrefix(info.Main.Version, "v")
+	}
+	return version
+}
 
 // Exit codes.
 const (
@@ -66,7 +81,7 @@ type options struct {
 	sessionID, resume                                                                                                      string
 	permissionTimeout, cancelGrace, shutdownBudget, opTimeout                                                              time.Duration
 	contextWindow, maxUpdateText, maxAttempts                                                                              int
-	promptCacheKey                                                                                                         bool
+	promptCacheKey, showVersion                                                                                            bool
 }
 
 func parseFlags() options {
@@ -93,6 +108,7 @@ func parseFlags() options {
 	flag.BoolVar(&o.promptCacheKey, "prompt-cache-key", false, "send the session id as prompt_cache_key")
 	flag.StringVar(&o.sessionID, "session-id", "", "bound mode: create this session id on the first session/new (error if it exists)")
 	flag.StringVar(&o.resume, "resume", "", "bound mode: open this existing session id on the first session/new, without replay")
+	flag.BoolVar(&o.showVersion, "version", false, "print the version and exit")
 	flag.Parse()
 	return o
 }
@@ -110,6 +126,10 @@ func run() int {
 	// inherited by every tool across exec.
 	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
 	o := parseFlags()
+	if o.showVersion {
+		fmt.Println("acp-unreal", buildVersion())
+		return 0
+	}
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 
 	usage := func(format string, args ...any) int {
@@ -187,7 +207,7 @@ func run() int {
 			OpTimeout: o.opTimeout, NewAdapter: newAdapter, Log: logger,
 		},
 		DefaultModel: o.model, Models: splitCSV(o.models), Bound: bound,
-		ShutdownBudget: o.shutdownBudget, Version: version,
+		ShutdownBudget: o.shutdownBudget, Version: buildVersion(),
 	})
 	// Descendants that detach with setsid are re-parented here instead of
 	// to init, reaped as they exit, and killed at shutdown.

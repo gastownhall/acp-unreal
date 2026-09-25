@@ -180,6 +180,10 @@ func ParseFrame(frame []byte, emit func(Delta)) {
 
 // NewHTTPClient mirrors primitives.newRemoteHTTPClient (remote.go:142-157)
 // with the tee in front.
+//
+// The transport settings are adapted from github.com/unreallabsai/unreal-agent
+// v0.1.1, harness/primitives/remote.go. Copyright (c) 2026 Unreal Labs.
+// MIT License; see NOTICE.
 func NewHTTPClient(sink func(Delta)) *http.Client {
 	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 	base := &http.Transport{
