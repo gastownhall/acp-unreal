@@ -557,3 +557,29 @@ func TestNestedAgentBindsOnlyToItsOwnGCSession(t *testing.T) {
 	}
 	a.stop()
 }
+
+// session/load and session/resume refuse a cwd that contains the state dir,
+// as session/new does: tools could otherwise read and rewrite agent state.
+func TestAttachRefusesAWorkspaceHoldingTheStateDir(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
+	a.initialize()
+	sid := a.newSession()
+	a.prompt(sid, "hello")
+	if _, err := a.conn.CloseSession(a.ctx(), acp.CloseSessionRequest{SessionId: sid}); err != nil {
+		t.Fatal(err)
+	}
+	outer := filepath.Dir(state)
+	var rpc *acp.RequestError
+	if _, err := a.conn.LoadSession(a.ctx(), acp.LoadSessionRequest{SessionId: sid, Cwd: outer, McpServers: []acp.McpServer{}}); !errors.As(err, &rpc) || rpc.Code != -32602 {
+		t.Fatalf("session/load with the state dir inside cwd: err = %v, want invalid params", err)
+	}
+	if _, err := a.conn.ResumeSession(a.ctx(), acp.ResumeSessionRequest{SessionId: sid, Cwd: outer}); !errors.As(err, &rpc) || rpc.Code != -32602 {
+		t.Fatalf("session/resume with the state dir inside cwd: err = %v, want invalid params", err)
+	}
+	if _, err := a.conn.ResumeSession(a.ctx(), acp.ResumeSessionRequest{SessionId: sid, Cwd: ws}); err != nil {
+		t.Fatalf("session/resume in the original workspace: %v", err)
+	}
+	a.stop()
+}

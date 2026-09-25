@@ -153,14 +153,23 @@ func insideDir(path, dir string) bool {
 	return err == nil && (rel == "." || (rel != ".." && !strings.HasPrefix(rel, "../")))
 }
 
+// checkWorkspace validates a session cwd: absolute, and not containing the
+// state dir (tools could otherwise read and rewrite agent state).
+func (a *Agent) checkWorkspace(cwd string) error {
+	if !filepath.IsAbs(cwd) {
+		return invalid("cwd must be absolute")
+	}
+	if insideDir(a.layout().Root, filepath.Clean(cwd)) {
+		return invalid("state dir %s is inside the workspace %s; move --state-dir outside it", a.layout().Root, cwd)
+	}
+	return nil
+}
+
 // NewSession implements acp.Agent. The first successful session/new of a
 // bound process uses the bound id; others mint a uuid.
 func (a *Agent) NewSession(_ context.Context, params acp.NewSessionRequest) (acp.NewSessionResponse, error) {
-	if !filepath.IsAbs(params.Cwd) {
-		return acp.NewSessionResponse{}, invalid("cwd must be absolute")
-	}
-	if insideDir(a.layout().Root, filepath.Clean(params.Cwd)) {
-		return acp.NewSessionResponse{}, invalid("state dir %s is inside the workspace %s; move --state-dir outside it", a.layout().Root, params.Cwd)
+	if err := a.checkWorkspace(params.Cwd); err != nil {
+		return acp.NewSessionResponse{}, err
 	}
 	if len(params.McpServers) > 0 {
 		a.log.Warn("MCP servers are not supported by the unreal harness; ignoring", "count", len(params.McpServers))
@@ -230,6 +239,10 @@ func (a *Agent) open(id session.ID, cwd string, mode BoundMode) (*runtime.Runtim
 	if meta.Cwd == "" {
 		return fail(invalid("cwd is required for session %s", id))
 	}
+	// Also for load/resume, and for a stored cwd a later --state-dir sits in.
+	if err := a.checkWorkspace(meta.Cwd); err != nil {
+		return fail(err)
+	}
 	if err := layout.WriteMeta(id, meta); err != nil {
 		return fail(internal(err))
 	}
@@ -250,8 +263,10 @@ func (a *Agent) attach(id acp.SessionId, cwd string) (*runtime.Runtime, error) {
 	if !ValidSessionID(string(id)) {
 		return nil, invalid("invalid session id %q", id)
 	}
-	if cwd != "" && !filepath.IsAbs(cwd) {
-		return nil, invalid("cwd must be absolute")
+	if cwd != "" {
+		if err := a.checkWorkspace(cwd); err != nil {
+			return nil, err
+		}
 	}
 	return a.open(session.ID(id), cwd, loadExisting)
 }
