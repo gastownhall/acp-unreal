@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -187,6 +188,7 @@ type Runtime struct {
 	inputs         map[string]bool
 	pgids          map[operation.ID]int
 	cancelledCalls map[string]bool
+	announced      map[string]bool // tool calls this connection has seen a tool_call for
 	refuseNew      bool
 	alwaysAllow    bool
 	alwaysReject   bool
@@ -213,7 +215,7 @@ func Open(parent context.Context, cfg Config, client Client, id session.ID, meta
 		model: model, effort: llm.ReasoningEffort(meta.Effort),
 		sync: mirror.NewSync(), events: fifo.New[event](), log: cfg.Log.With("session", string(id)),
 		opCall: map[operation.ID]string{}, calls: map[string]llm.ToolCall{}, inputs: map[string]bool{},
-		pgids: map[operation.ID]int{}, cancelledCalls: map[string]bool{},
+		pgids: map[operation.ID]int{}, cancelledCalls: map[string]bool{}, announced: map[string]bool{},
 		am: mirror.New(), streamedText: map[uint64]bool{}, streamedThought: map[uint64]bool{},
 		responseKey: map[uint64]string{}, started: map[string]bool{}, reported: map[string]bool{},
 	}
@@ -688,6 +690,10 @@ func (r *Runtime) handle(ev event) {
 	case evOp:
 		r.projectOperation(ev.op)
 	case evPermission:
+		r.mu.Lock()
+		callID := r.opCall[ev.op.ID]
+		r.mu.Unlock()
+		r.announce(callID)
 		go r.askPermission(ev.heldCtx, ev.op)
 	case evModelError:
 		r.log.Warn("model request failed", "err", ev.err)
@@ -742,6 +748,7 @@ func (r *Runtime) handle(ev event) {
 		for _, id := range calls {
 			if !r.reported[id] {
 				r.reported[id] = true
+				r.announce(id)
 				r.send(project.Failed(id, "Cancelled by the user."))
 			}
 		}
@@ -828,8 +835,52 @@ func (r *Runtime) evaluate() {
 	r.mu.Unlock()
 }
 
+// announce sends the pending tool_call for callID unless this connection
+// already saw one. After a restart without replay (bound mode) the history
+// holds calls the client never saw; ACP clients key tool_call_update on a
+// previously announced toolCallId.
+func (r *Runtime) announce(callID string) {
+	r.mu.Lock()
+	call, known := r.calls[callID]
+	fresh := known && !r.announced[callID]
+	if fresh {
+		r.announced[callID] = true
+	}
+	r.mu.Unlock()
+	if fresh {
+		r.send(project.ToolCallStart(call, r.cfg.MaxUpdateText))
+	}
+}
+
+// redact hides the absolute state directory in tool results: failure text
+// of interrupted tools names capture files below it.
+func (r *Runtime) redact(update acp.SessionUpdate) acp.SessionUpdate {
+	u := update.ToolCallUpdate
+	root := r.cfg.Layout.Root
+	if u == nil || root == "" {
+		return update
+	}
+	content := slices.Clone(u.Content)
+	for i, part := range content {
+		if part.Content != nil && part.Content.Content.Text != nil && strings.Contains(part.Content.Content.Text.Text, root) {
+			text := strings.ReplaceAll(part.Content.Content.Text.Text, root, "<state-dir>")
+			content[i] = acp.ToolContent(acp.TextBlock(text))
+		}
+	}
+	copied := *u
+	copied.Content = content
+	update.ToolCallUpdate = &copied
+	return update
+}
+
 func (r *Runtime) send(updates ...acp.SessionUpdate) {
 	for _, update := range updates {
+		update = r.redact(update)
+		if update.ToolCall != nil {
+			r.mu.Lock()
+			r.announced[string(update.ToolCall.ToolCallId)] = true
+			r.mu.Unlock()
+		}
 		if err := r.client.SessionUpdate(r.ctx, acp.SessionNotification{SessionId: acp.SessionId(r.id), Update: update}); err != nil {
 			r.log.Warn("session/update", "err", err)
 		}
@@ -885,7 +936,7 @@ func (r *Runtime) projectLive(item sessionstore.Item) {
 					r.send(project.AgentText(data.Text, project.MessageID(string(r.id), response.ID, project.KindMessage), limit)...)
 				}
 			case llm.ToolCall:
-				r.send(project.ToolCallStart(data, limit))
+				r.announce(data.CallID)
 			}
 		}
 		delete(r.streamedText, record.Seq)
@@ -900,6 +951,7 @@ func (r *Runtime) projectLive(item sessionstore.Item) {
 			return
 		}
 		r.reported[status.CallID] = true
+		r.announce(status.CallID)
 		r.mu.Lock()
 		call := r.calls[status.CallID]
 		r.mu.Unlock()
@@ -918,6 +970,7 @@ func (r *Runtime) projectOperation(op operation.Operation) {
 		return
 	}
 	r.started[callID] = true
+	r.announce(callID)
 	r.send(project.InProgress(callID))
 }
 

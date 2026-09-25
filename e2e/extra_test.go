@@ -412,3 +412,50 @@ func TestOpTimeoutKillsTermIgnoringTool(t *testing.T) {
 	}
 	a.stop()
 }
+
+// After the agent is SIGKILLed mid-tool and restarted in bound mode (no
+// replay), the next turn reports the interrupted call. The client has never
+// seen that toolCallId on this connection, so it must be announced first,
+// and failure text must not reveal absolute state-dir paths.
+func TestBoundRestartAnnouncesInterruptedCallAndHidesStatePaths(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	env := []string{"GC_SESSION_ID=restart-s", "GC_CONTINUATION_EPOCH=1"}
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: env})
+	a.initialize()
+	sid := a.newSession()
+	_, pgid := startTermIgnoringTool(t, a, sid)
+	_ = syscall.Kill(a.cmd.Process.Pid, syscall.SIGKILL)
+	a.waitExit(5 * time.Second)
+	_ = syscall.Kill(-pgid, syscall.SIGKILL) // the orphaned tool (gc's orphan sweep would do this)
+	waitFor(t, 5*time.Second, "orphan gone", func() bool { return len(liveInGroup(pgid)) == 0 })
+
+	b := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: env, marker: a.opts.marker})
+	b.initialize()
+	if again := b.newSession(); again != sid {
+		t.Fatalf("restart id %q, want %q", again, sid)
+	}
+	b.prompt(sid, "after restart")
+	announced := map[acp.ToolCallId]bool{}
+	updates := 0
+	for _, u := range b.client.snapshot() {
+		switch {
+		case u.ToolCall != nil:
+			announced[u.ToolCall.ToolCallId] = true
+		case u.ToolCallUpdate != nil:
+			updates++
+			if !announced[u.ToolCallUpdate.ToolCallId] {
+				t.Fatalf("tool_call_update for %s before any tool_call on this connection", u.ToolCallUpdate.ToolCallId)
+			}
+		}
+	}
+	if updates == 0 {
+		t.Fatal("the interrupted call was never reported")
+	}
+	for i, line := range b.tee.all() {
+		if strings.Contains(line, state) {
+			t.Fatalf("stdout line %d reveals the state dir: %.300s", i, line)
+		}
+	}
+	b.stop()
+}
