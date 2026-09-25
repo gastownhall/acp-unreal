@@ -43,12 +43,25 @@ func (l Layout) Exists(id session.ID) bool {
 }
 
 // Meta is the per-session sidecar: things the session file does not record
-// (the model id never reaches it, llm/model.go:118-124).
+// (the model id never reaches it, llm/model.go:118-124). It stores only
+// explicit client choices; the launch --model applies otherwise, so an
+// operator's model change reaches existing sessions.
 type Meta struct {
-	Cwd       string `json:"cwd"`
-	Model     string `json:"model"`
+	Cwd string `json:"cwd"`
+	// ModelOverride is a model chosen by session/set_config_option.
+	ModelOverride string `json:"model_override,omitempty"`
+	// Effort is a reasoning effort chosen by session/set_config_option
+	// ("" = provider default).
 	Effort    string `json:"effort,omitempty"`
 	CreatedAt string `json:"created_at"`
+}
+
+// EffectiveModel is the override if any, else the launch model.
+func (m Meta) EffectiveModel(launch string) string {
+	if m.ModelOverride != "" {
+		return m.ModelOverride
+	}
+	return launch
 }
 
 // ReadMeta loads the sidecar.

@@ -113,3 +113,33 @@ func TestModelOverrideAndServedModel(t *testing.T) {
 		t.Fatalf("sent=%q served=%q", sent, rec.Model)
 	}
 }
+
+func TestEffortOverrideIncludingProviderDefault(t *testing.T) {
+	var sent []llm.ReasoningEffort
+	effort := llm.ReasoningEffortLow
+	g := New(adapterFunc(func(_ context.Context, r llm.Request, _ llm.RequestOptions) (llm.Response, error) {
+		sent = append(sent, r.Model.ReasoningEffort)
+		return llm.Response{Stop: llm.StopComplete}, nil
+	}), Options{Effort: func() llm.ReasoningEffort { return effort }})
+	request := llm.Request{Model: llm.Model{ID: "m", ReasoningEffort: llm.ReasoningEffortHigh}}
+	g.Respond(context.Background(), request, llm.RequestOptions{})
+	effort = ""
+	g.Respond(context.Background(), request, llm.RequestOptions{})
+	if len(sent) != 2 || sent[0] != llm.ReasoningEffortLow || sent[1] != "" {
+		t.Fatalf("sent efforts = %q", sent)
+	}
+}
+
+func TestSyntheticResponseIDsAreUniqueAcrossGates(t *testing.T) {
+	ids := map[string]bool{}
+	for range 3 {
+		g := New(adapterFunc(func(context.Context, llm.Request, llm.RequestOptions) (llm.Response, error) {
+			return llm.Response{Stop: llm.StopComplete}, nil
+		}), Options{})
+		resp, _ := g.Respond(context.Background(), llm.Request{}, llm.RequestOptions{})
+		if ids[resp.ID] {
+			t.Fatalf("response id %q repeats across gates (restarts)", resp.ID)
+		}
+		ids[resp.ID] = true
+	}
+}

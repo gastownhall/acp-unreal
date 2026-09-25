@@ -182,7 +182,6 @@ type Runtime struct {
 	gen            *generation
 	model          string
 	effort         llm.ReasoningEffort
-	settingsDirty  bool
 	opCall         map[operation.ID]string
 	calls          map[string]llm.ToolCall
 	inputs         map[string]bool
@@ -203,15 +202,15 @@ type Runtime struct {
 
 // Open attaches to an existing session log (the caller created it if new
 // and holds lock, which Close releases). No coordinator starts, so opening
-// never spends tokens.
-func Open(parent context.Context, cfg Config, client Client, id session.ID, meta Meta, lock *Lock) (*Runtime, error) {
+// never spends tokens. model is the effective model (see Meta.EffectiveModel).
+func Open(parent context.Context, cfg Config, client Client, id session.ID, meta Meta, model string, lock *Lock) (*Runtime, error) {
 	store, err := localfile.New(cfg.Layout.SessionsDir())
 	if err != nil {
 		return nil, fmt.Errorf("open session store: %w", err)
 	}
 	r := &Runtime{
 		cfg: cfg, client: client, id: id, cwd: meta.Cwd, lock: lock, store: store,
-		model: meta.Model, effort: llm.ReasoningEffort(meta.Effort),
+		model: model, effort: llm.ReasoningEffort(meta.Effort),
 		sync: mirror.NewSync(), events: fifo.New[event](), log: cfg.Log.With("session", string(id)),
 		opCall: map[operation.ID]string{}, calls: map[string]llm.ToolCall{}, inputs: map[string]bool{},
 		pgids: map[operation.ID]int{}, cancelledCalls: map[string]bool{},
@@ -246,7 +245,7 @@ func Open(parent context.Context, cfg Config, client Client, id session.ID, meta
 		opsCancel()
 		return fail(err)
 	}
-	r.gate = gate.New(adapter, gate.Options{Reasons: r.sync.TurnReasons, Model: r.currentModel, OnError: r.onModelError})
+	r.gate = gate.New(adapter, gate.Options{Reasons: r.sync.TurnReasons, Model: r.currentModel, Effort: r.currentEffort, OnError: r.onModelError})
 	// Anything already pending (an interrupted turn) is parked until the next
 	// prompt adds a new input: restore re-wakes the model immediately at Run
 	// start (loop.go:110-116) and must not re-answer a cancelled prompt.
@@ -348,6 +347,12 @@ func (r *Runtime) currentModel() string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.model
+}
+
+func (r *Runtime) currentEffort() llm.ReasoningEffort {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.effort
 }
 
 // policy runs inside ops.Manager.Add on the coordinator goroutine: it must
@@ -463,12 +468,6 @@ func (r *Runtime) ensureGeneration() (*generation, error) {
 		close(gen.done)
 		r.events.Push(event{kind: evRunExit, gen: gen, err: err})
 	}()
-	if r.settingsDirty && r.effort != "" {
-		r.settingsDirty = false
-		if err := submitControl(r.ctx, in, inbox.ControlMessage{Mode: inbox.UpdateSettings, Parameters: inbox.Settings{ReasoningEffort: r.effort}}); err != nil {
-			r.log.Warn("submit settings", "err", err)
-		}
-	}
 	return gen, nil
 }
 
@@ -974,21 +973,12 @@ func (r *Runtime) Replay(ctx context.Context) error {
 	}
 }
 
-// SetEffort records a reasoning-effort change durably through the inbox
-// (UpdateSettings is persisted and replayed).
+// SetEffort sets the reasoning effort of the next request ("" = provider
+// default); like the model, the Gate applies it per request.
 func (r *Runtime) SetEffort(effort llm.ReasoningEffort) {
 	r.mu.Lock()
 	r.effort = effort
-	gen := r.gen
-	if gen == nil {
-		r.settingsDirty = true
-	}
 	r.mu.Unlock()
-	if gen != nil {
-		if err := submitControl(r.ctx, gen.inbox, inbox.ControlMessage{Mode: inbox.UpdateSettings, Parameters: inbox.Settings{ReasoningEffort: effort}}); err != nil {
-			r.log.Warn("submit settings", "err", err)
-		}
-	}
 }
 
 // SetModel switches the model for the next request; the Gate rewrites

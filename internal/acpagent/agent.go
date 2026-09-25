@@ -9,6 +9,7 @@ import (
 	"io/fs"
 	"log/slog"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -217,9 +218,9 @@ func (a *Agent) open(id session.ID, cwd string, mode BoundMode) (*runtime.Runtim
 		if _, err := store.Create(a.ctx, id); err != nil {
 			return fail(internal(fmt.Errorf("create session %s: %w", id, err)))
 		}
-		meta = runtime.Meta{Model: a.cfg.DefaultModel, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+		meta = runtime.Meta{CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	} else if metaErr != nil {
-		meta = runtime.Meta{Model: a.cfg.DefaultModel, CreatedAt: time.Now().UTC().Format(time.RFC3339)}
+		meta = runtime.Meta{CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	}
 	if cwd != "" {
 		meta.Cwd = cwd
@@ -227,13 +228,10 @@ func (a *Agent) open(id session.ID, cwd string, mode BoundMode) (*runtime.Runtim
 	if meta.Cwd == "" {
 		return fail(invalid("cwd is required for session %s", id))
 	}
-	if meta.Model == "" {
-		meta.Model = a.cfg.DefaultModel
-	}
 	if err := layout.WriteMeta(id, meta); err != nil {
 		return fail(internal(err))
 	}
-	r, err := runtime.Open(a.ctx, a.cfg.Runtime, a.client, id, meta, lock)
+	r, err := runtime.Open(a.ctx, a.cfg.Runtime, a.client, id, meta, meta.EffectiveModel(a.cfg.DefaultModel), lock)
 	if err != nil {
 		return fail(internal(err))
 	}
@@ -296,7 +294,7 @@ func (a *Agent) ListSessions(ctx context.Context, params acp.ListSessionsRequest
 		updated := info.LastUpdatedAt.UTC().Format(time.RFC3339)
 		sessions = append(sessions, acp.SessionInfo{
 			SessionId: acp.SessionId(info.ID), Cwd: meta.Cwd, UpdatedAt: &updated,
-			Meta: map[string]any{"model": meta.Model, "createdAt": meta.CreatedAt},
+			Meta: map[string]any{"model": meta.EffectiveModel(a.cfg.DefaultModel), "createdAt": meta.CreatedAt},
 		})
 	}
 	return acp.ListSessionsResponse{Sessions: sessions}, nil
@@ -348,19 +346,24 @@ func (a *Agent) SetSessionConfigOption(_ context.Context, params acp.SetSessionC
 		meta = runtime.Meta{Cwd: r.Cwd(), CreatedAt: time.Now().UTC().Format(time.RFC3339)}
 	}
 	switch params.ValueId.ConfigId {
-	case "model":
+	case configModel:
 		if value == "" {
 			return acp.SetSessionConfigOptionResponse{}, invalid("model must not be empty")
 		}
+		if len(a.cfg.Models) > 0 && value != a.cfg.DefaultModel && !slices.Contains(a.cfg.Models, value) {
+			return acp.SetSessionConfigOptionResponse{}, invalid("model %q is not offered (--models)", value)
+		}
 		r.SetModel(value)
-		meta.Model = value
-	case "thought_level":
+		meta.ModelOverride = value
+	case configThoughtLevel:
 		effort := llm.ReasoningEffort(value)
-		if !effort.Valid() {
+		if value == thoughtDefault {
+			effort = ""
+		} else if !effort.Valid() {
 			return acp.SetSessionConfigOptionResponse{}, invalid("invalid thought_level %q", value)
 		}
 		r.SetEffort(effort)
-		meta.Effort = value
+		meta.Effort = string(effort)
 	default:
 		return acp.SetSessionConfigOptionResponse{}, invalid("unknown config option %q", params.ValueId.ConfigId)
 	}
@@ -412,10 +415,18 @@ func (a *Agent) HandleExtensionMethod(_ context.Context, method string, params j
 	return map[string]any{"inputId": id}, nil
 }
 
+// Config option ids and the thought_level value meaning "send no effort".
+const (
+	configModel        = "model"
+	configThoughtLevel = "thought_level"
+	thoughtDefault     = "default"
+)
+
 func (a *Agent) configOptions(r *runtime.Runtime) []acp.SessionConfigOption {
 	model, effort := r.ModelAndEffort()
+	current := acp.SessionConfigValueId(effort)
 	if effort == "" {
-		effort = llm.ReasoningEffortHigh
+		current = thoughtDefault
 	}
 	models := acp.SessionConfigSelectOptionsUngrouped{}
 	seen := map[string]bool{}
@@ -426,13 +437,14 @@ func (a *Agent) configOptions(r *runtime.Runtime) []acp.SessionConfigOption {
 		seen[name] = true
 		models = append(models, acp.SessionConfigSelectOption{Name: name, Value: acp.SessionConfigValueId(name)})
 	}
-	efforts := acp.SessionConfigSelectOptionsUngrouped{}
+	efforts := acp.SessionConfigSelectOptionsUngrouped{{Name: "Provider default", Value: thoughtDefault}}
 	for _, level := range []llm.ReasoningEffort{llm.ReasoningEffortLow, llm.ReasoningEffortMedium, llm.ReasoningEffortHigh, llm.ReasoningEffortXHigh, llm.ReasoningEffortMax} {
 		efforts = append(efforts, acp.SessionConfigSelectOption{Name: string(level), Value: acp.SessionConfigValueId(level)})
 	}
+	modelCategory, thoughtCategory := acp.SessionConfigOptionCategoryModel, acp.SessionConfigOptionCategoryThoughtLevel
 	return []acp.SessionConfigOption{
-		{Select: &acp.SessionConfigOptionSelect{Id: "model", Name: "Model", Type: "select", CurrentValue: acp.SessionConfigValueId(model), Options: acp.SessionConfigSelectOptions{Ungrouped: &models}}},
-		{Select: &acp.SessionConfigOptionSelect{Id: "thought_level", Name: "Reasoning effort", Type: "select", CurrentValue: acp.SessionConfigValueId(effort), Options: acp.SessionConfigSelectOptions{Ungrouped: &efforts}}},
+		{Select: &acp.SessionConfigOptionSelect{Id: configModel, Name: "Model", Type: "select", Category: &modelCategory, CurrentValue: acp.SessionConfigValueId(model), Options: acp.SessionConfigSelectOptions{Ungrouped: &models}}},
+		{Select: &acp.SessionConfigOptionSelect{Id: configThoughtLevel, Name: "Reasoning effort", Type: "select", Category: &thoughtCategory, CurrentValue: current, Options: acp.SessionConfigSelectOptions{Ungrouped: &efforts}}},
 	}
 }
 

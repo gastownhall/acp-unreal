@@ -49,6 +49,9 @@ type Options struct {
 	Reasons func() []string
 	// Model returns the model id to send; it overrides Request.Model.ID.
 	Model func() string
+	// Effort, if set, returns the reasoning effort to send ("" = provider
+	// default); it overrides Request.Model.ReasoningEffort.
+	Effort func() llm.ReasoningEffort
 	// OnError is told about provider failures that were answered empty.
 	OnError func(seq uint64, err error)
 }
@@ -178,9 +181,14 @@ func (g *Gate) allParkedLocked(reasons []string) bool {
 
 // Respond implements llm.Adapter.
 func (g *Gate) Respond(ctx context.Context, request llm.Request, options llm.RequestOptions) (llm.Response, error) {
+	// Model and Effort may take the runtime lock; never call them while
+	// holding g.mu.
 	model := ""
 	if g.opts.Model != nil {
-		model = g.opts.Model() // may take the runtime lock; never call it while holding g.mu
+		model = g.opts.Model()
+	}
+	if g.opts.Effort != nil {
+		request.Model.ReasoningEffort = g.opts.Effort()
 	}
 	reasons := g.opts.Reasons()
 	g.mu.Lock()

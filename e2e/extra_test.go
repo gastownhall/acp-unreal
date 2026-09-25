@@ -245,3 +245,108 @@ func TestCancelledPartialReplaysUnderLiveMessageID(t *testing.T) {
 	}
 	a.stop()
 }
+
+func configOption(t *testing.T, options []acp.SessionConfigOption, id string) *acp.SessionConfigOptionSelect {
+	t.Helper()
+	for _, o := range options {
+		if o.Select != nil && string(o.Select.Id) == id {
+			return o.Select
+		}
+	}
+	t.Fatalf("config option %q missing: %+v", id, options)
+	return nil
+}
+
+func setConfig(a *agentProc, sid acp.SessionId, id, value string) (acp.SetSessionConfigOptionResponse, error) {
+	return a.conn.SetSessionConfigOption(a.ctx(), acp.SetSessionConfigOptionRequest{ValueId: &acp.SetSessionConfigOptionValueId{
+		SessionId: sid, ConfigId: acp.SessionConfigId(id), Value: acp.SessionConfigValueId(value),
+	}})
+}
+
+// The launch --model is operator configuration: a restart with a new
+// --model reaches an existing bound session. Only an explicit client
+// set_config_option model persists, and it must be one of --models.
+func TestModelFollowsLaunchFlagUnlessClientOverrides(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	env := []string{"GC_SESSION_ID=model-s", "GC_CONTINUATION_EPOCH=1"}
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: env})
+	a.initialize()
+	resp, err := a.conn.NewSession(a.ctx(), acp.NewSessionRequest{Cwd: ws, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sid := resp.SessionId
+	model := configOption(t, resp.ConfigOptions, "model")
+	if model.Category == nil || *model.Category != acp.SessionConfigOptionCategoryModel || model.CurrentValue != "fake-1" {
+		t.Fatalf("model option = %+v", model)
+	}
+	thought := configOption(t, resp.ConfigOptions, "thought_level")
+	if thought.Category == nil || *thought.Category != acp.SessionConfigOptionCategoryThoughtLevel || thought.CurrentValue != "default" {
+		t.Fatalf("thought_level option = %+v", thought)
+	}
+	a.prompt(sid, "one")
+	if got := llm.Requests()[0]; got.Model != "fake-1" || got.Effort != "" {
+		t.Fatalf("request 1 model %q effort %q", got.Model, got.Effort)
+	}
+	a.terminate()
+
+	// Operator changes the launch model: the existing session follows it.
+	b := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: env, args: []string{"--model", "fake-3", "--models", "fake-2,fake-3"}})
+	b.initialize()
+	resp, err = b.conn.NewSession(b.ctx(), acp.NewSessionRequest{Cwd: ws, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := configOption(t, resp.ConfigOptions, "model").CurrentValue; got != "fake-3" {
+		t.Fatalf("after relaunch with --model fake-3 currentValue = %q", got)
+	}
+	b.prompt(sid, "two")
+	reqs := llm.Requests()
+	if got := reqs[len(reqs)-1].Model; got != "fake-3" {
+		t.Fatalf("request after relaunch used model %q", got)
+	}
+	if _, err := setConfig(b, sid, "model", "not-offered"); err == nil || !strings.Contains(err.Error(), "Invalid params") {
+		t.Fatalf("unoffered model: err=%v", err)
+	}
+	set, err := setConfig(b, sid, "model", "fake-2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := configOption(t, set.ConfigOptions, "model").CurrentValue; got != "fake-2" {
+		t.Fatalf("after set currentValue = %q", got)
+	}
+	set, err = setConfig(b, sid, "thought_level", "low")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := configOption(t, set.ConfigOptions, "thought_level").CurrentValue; got != "low" {
+		t.Fatalf("thought_level currentValue = %q", got)
+	}
+	b.prompt(sid, "three")
+	reqs = llm.Requests()
+	if got := reqs[len(reqs)-1]; got.Model != "fake-2" || got.Effort != "low" {
+		t.Fatalf("request after set: model %q effort %q", got.Model, got.Effort)
+	}
+	b.terminate()
+
+	// The explicit client choice survives a relaunch with another --model.
+	c := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: env, args: []string{"--model", "fake-4", "--models", "fake-2,fake-4"}})
+	c.initialize()
+	resp, err = c.conn.NewSession(c.ctx(), acp.NewSessionRequest{Cwd: ws, McpServers: []acp.McpServer{}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := configOption(t, resp.ConfigOptions, "model").CurrentValue; got != "fake-2" {
+		t.Fatalf("explicit override lost: currentValue = %q", got)
+	}
+	if _, err := setConfig(c, sid, "thought_level", "default"); err != nil {
+		t.Fatal(err)
+	}
+	c.prompt(sid, "four")
+	reqs = llm.Requests()
+	if got := reqs[len(reqs)-1]; got.Model != "fake-2" || got.Effort != "" {
+		t.Fatalf("request after relaunch: model %q effort %q", got.Model, got.Effort)
+	}
+	c.stop()
+}
