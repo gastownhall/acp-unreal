@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -22,6 +23,7 @@ import (
 	"github.com/unreallabsai/unreal-agent/harness/primitives"
 
 	"github.com/gastownhall/acp-unreal/internal/acpagent"
+	"github.com/gastownhall/acp-unreal/internal/reaper"
 	"github.com/gastownhall/acp-unreal/internal/runtime"
 	"github.com/gastownhall/acp-unreal/internal/tap"
 )
@@ -187,6 +189,19 @@ func run() int {
 		DefaultModel: o.model, Models: splitCSV(o.models), Bound: bound,
 		ShutdownBudget: o.shutdownBudget, Version: version,
 	})
+	// Descendants that detach with setsid are re-parented here instead of
+	// to init, reaped as they exit, and killed at shutdown.
+	if err := reaper.Enable(); err != nil {
+		logger.Warn("child subreaper unavailable; setsid-detached tool descendants can outlive the agent", "err", err)
+	}
+	reaperCtx, stopReaper := context.WithCancel(context.Background())
+	defer stopReaper()
+	go reaper.Run(reaperCtx)
+	shutdown := func() {
+		agent.Shutdown()
+		stopReaper()
+		reaper.KillDescendants(logger)
+	}
 	// The SDK logs via slog.Default() when no logger is set. Connection.
 	// SetLogger is unsynchronized with the reader goroutine the constructor
 	// starts (acp-go-sdk connection.go:125 vs :128), so set the default
@@ -208,11 +223,11 @@ func run() int {
 				continue
 			}
 			logger.Info("shutting down", "signal", sig.String())
-			agent.Shutdown()
+			shutdown()
 			return 0
 		case <-conn.Done():
 			logger.Info("client disconnected; shutting down")
-			agent.Shutdown()
+			shutdown()
 			return 0
 		}
 	}

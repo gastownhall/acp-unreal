@@ -501,6 +501,42 @@ func readStat(pid int) (procInfo, bool) {
 	return procInfo{pid: pid, pgid: pgid, state: fields[0], comm: s[open+1 : closeIdx]}, true
 }
 
+// parentPID reads the ppid of pid (0 if it is gone).
+func parentPID(pid int) int {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0
+	}
+	s := string(data)
+	fields := strings.Fields(s[strings.LastIndexByte(s, ')')+2:])
+	ppid, _ := strconv.Atoi(fields[1])
+	return ppid
+}
+
+// zombieChildren counts exited, unreaped children of pid.
+func zombieChildren(pid int) int {
+	n := 0
+	for _, p := range allProcs() {
+		if parentPID(p.pid) == pid && p.state == "Z" {
+			n++
+		}
+	}
+	return n
+}
+
+func allProcs() []procInfo {
+	entries, _ := os.ReadDir("/proc")
+	var out []procInfo
+	for _, e := range entries {
+		if pid, err := strconv.Atoi(e.Name()); err == nil {
+			if info, ok := readStat(pid); ok {
+				out = append(out, info)
+			}
+		}
+	}
+	return out
+}
+
 // markedProcs lists live (non-zombie) processes carrying the marker env var,
 // excluding exclude (the agent itself).
 func markedProcs(marker string, exclude int) []procInfo {

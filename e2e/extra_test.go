@@ -459,3 +459,39 @@ func TestBoundRestartAnnouncesInterruptedCallAndHidesStatePaths(t *testing.T) {
 	}
 	b.stop()
 }
+
+// A tool can detach a descendant with setsid (daemons, tmux new -d); it
+// escapes both the library's group SIGTERM and the agent's pgid SIGKILL.
+// The agent is a child subreaper, so the escapee is re-parented to it, and
+// shutdown kills it.
+func TestShutdownKillsSetsidEscapedDescendants(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
+	a.initialize()
+	sid := a.newSession()
+	a.prompt(sid, `RUN[setsid sleep 64 >/dev/null 2>&1 < /dev/null & sleep 0.5; echo launched]`)
+	var escapee procInfo
+	waitFor(t, 5*time.Second, "setsid escapee running", func() bool {
+		for _, p := range markedProcs(a.opts.marker, a.cmd.Process.Pid) {
+			if p.comm == "sleep" {
+				escapee = p
+				return true
+			}
+		}
+		return false
+	})
+	if ppid := parentPID(escapee.pid); ppid != a.cmd.Process.Pid {
+		t.Fatalf("escapee ppid = %d, want the agent %d (child subreaper)", ppid, a.cmd.Process.Pid)
+	}
+	// An adopted escapee that exits is reaped, not left a zombie.
+	a.prompt(sid, `RUN[setsid sleep 1 >/dev/null 2>&1 < /dev/null & sleep 0.3; echo launched]`)
+	waitFor(t, 5*time.Second, "second escapee adopted", func() bool { return len(markedProcs(a.opts.marker, a.cmd.Process.Pid)) == 2 })
+	waitFor(t, 5*time.Second, "second escapee exited", func() bool { return len(markedProcs(a.opts.marker, a.cmd.Process.Pid)) == 1 })
+	time.Sleep(200 * time.Millisecond)
+	if n := zombieChildren(a.cmd.Process.Pid); n != 0 {
+		t.Fatalf("%d exited escapees left as zombies", n)
+	}
+	a.stop()
+	waitFor(t, 2*time.Second, "escapee killed", func() bool { return len(markedProcs(a.opts.marker, -1)) == 0 })
+}
