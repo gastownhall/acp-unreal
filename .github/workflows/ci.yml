@@ -34,6 +34,12 @@ jobs:
           fi
       - name: go vet
         run: go vet ./...
+      - name: cross-compile (macOS, FreeBSD)
+        run: |
+          for target in darwin/arm64 darwin/amd64 freebsd/amd64; do
+            echo "== $target"
+            GOOS="${target%/*}" GOARCH="${target#*/}" go vet ./...
+          done
       - name: go test
         run: go test ./... -count=1
       - name: go test -race

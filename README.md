@@ -302,9 +302,11 @@ add `--permission-mode ask` to the agent command line to be asked.
 - **No per-operation output cap.** The library captures full tool output to files in
   the state dir. What reaches the client and the model is bounded, but disk use is not.
 - **No `session/set_mode`.** Permission modes are launch flags.
-- **Linux for detached descendants.** Finding detached descendants reads `/proc`,
-  and the e2e tests need Linux. On other platforms tool process groups are still
-  killed, but `setsid`-detached descendants can outlive the agent.
+- **Linux is the tested platform.** Finding detached descendants reads `/proc`, and
+  the e2e tests need Linux. CI also compiles for macOS and FreeBSD but runs no tests
+  there. On those platforms tool process groups are still killed, but
+  `setsid`-detached descendants can outlive the agent, and the credential re-exec
+  uses `os.Executable()` instead of `/proc/self/exe`.
 
 ## Troubleshooting
 

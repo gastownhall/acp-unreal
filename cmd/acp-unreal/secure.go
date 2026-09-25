@@ -62,37 +62,53 @@ func loadAPIKey(o options) (string, error) {
 		}
 		fdValue = strconv.Itoa(fd)
 	}
-	self, err := os.Executable()
+	self, err := reexecPath(procSelfExe)
 	if err != nil {
-		self = "/proc/self/exe"
+		return "", fmt.Errorf("find own binary to re-exec with a scrubbed environment: %w", err)
 	}
-	err = syscall.Exec("/proc/self/exe", os.Args, append(kept, keyFDEnv+"="+fdValue))
+	err = syscall.Exec(self, os.Args, append(kept, keyFDEnv+"="+fdValue))
 	return "", fmt.Errorf("re-exec %s with a scrubbed environment: %w", self, err)
 }
 
-// keyPipe writes key into a new pipe and returns its read end with
-// close-on-exec cleared, so the re-exec'd process inherits it.
+// procSelfExe is the running binary on Linux, even if the file on disk was
+// replaced or removed since start.
+const procSelfExe = "/proc/self/exe"
+
+// reexecPath returns procSelf where it exists, else os.Executable() (macOS
+// and BSDs have no /proc).
+func reexecPath(procSelf string) (string, error) {
+	if _, err := os.Stat(procSelf); err == nil {
+		return procSelf, nil
+	}
+	return os.Executable()
+}
+
+// keyPipe writes key into a new pipe and returns a read end without
+// close-on-exec, so the re-exec'd process inherits it. dup(2) never copies
+// FD_CLOEXEC, which keeps this portable (no pipe2 or fcntl).
 func keyPipe(key string) (int, error) {
 	if len(key) > maxKeyBytes {
 		return 0, errors.New("API key is too large")
 	}
-	var fds [2]int
-	if err := syscall.Pipe2(fds[:], syscall.O_CLOEXEC); err != nil {
+	r, w, err := os.Pipe()
+	if err != nil {
 		return 0, fmt.Errorf("key pipe: %w", err)
 	}
-	// A pipe buffer (>= 4 KiB, 64 KiB on Linux) holds the key, so this
-	// write does not block without a reader.
-	if _, err := syscall.Write(fds[1], []byte(key)); err != nil {
-		syscall.Close(fds[0])
-		syscall.Close(fds[1])
+	defer r.Close()
+	// A pipe buffer (>= 4 KiB; 16 KiB on macOS, 64 KiB on Linux) holds the
+	// key, so this write does not block without a reader.
+	_, err = w.Write([]byte(key))
+	if cerr := w.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
 		return 0, fmt.Errorf("key pipe: %w", err)
 	}
-	syscall.Close(fds[1])
-	if _, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fds[0]), syscall.F_SETFD, 0); errno != 0 {
-		syscall.Close(fds[0])
-		return 0, fmt.Errorf("key pipe: %w", errno)
+	fd, err := syscall.Dup(int(r.Fd()))
+	if err != nil {
+		return 0, fmt.Errorf("key pipe: %w", err)
 	}
-	return fds[0], nil
+	return fd, nil
 }
 
 func readKeyFD(value string) (string, error) {
