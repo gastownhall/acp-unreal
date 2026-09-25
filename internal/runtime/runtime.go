@@ -126,10 +126,11 @@ type event struct {
 }
 
 type turnResult struct {
-	stop  acp.StopReason
-	err   error
-	usage acp.Usage
-	model string
+	stop            acp.StopReason
+	err             error
+	usage           acp.Usage
+	model           string
+	clientCancelled bool
 }
 
 type queuedInput struct{ id, text string }
@@ -141,14 +142,20 @@ type turnState struct {
 	unobserved map[string]bool // submitted to the inbox, not yet persisted
 	steers     []queuedInput
 	cancelling bool
-	flushed    bool
-	waitCalls  map[string]bool
-	stop       acp.StopReason
-	err        error
-	usage      acp.Usage
-	model      string
-	done       chan turnResult
-	finished   bool
+	// clientCancelled records that the CLIENT asked for the abort
+	// (session/cancel, prompt ctx cancel, SIGINT, session/close, shutdown).
+	// Only then may the turn answer stopReason cancelled; an abort the
+	// agent started itself (a provider failure with tools outstanding)
+	// answers the provider error.
+	clientCancelled bool
+	flushed         bool
+	waitCalls       map[string]bool
+	stop            acp.StopReason
+	err             error
+	usage           acp.Usage
+	model           string
+	done            chan turnResult
+	finished        bool
 }
 
 // generation is one coordinator.Run with its inbox.
@@ -548,9 +555,16 @@ func (r *Runtime) Prompt(ctx context.Context, text string, messageID *string) (a
 }
 
 func (result turnResult) response(id string) (acp.PromptResponse, error) {
-	// A cancelled turn always answers cancelled (ACP prompt-turn: the agent
-	// MUST NOT surface abort errors); an earlier provider error was logged.
-	if result.err != nil && result.stop != acp.StopReasonCancelled {
+	// A turn the client cancelled always answers cancelled (ACP prompt-turn:
+	// the agent MUST NOT surface abort errors; an earlier provider error was
+	// logged). Anything else that failed answers the error: ACP reserves
+	// cancelled for the client's session/cancel.
+	if result.clientCancelled {
+		result.stop, result.err = acp.StopReasonCancelled, nil
+	} else if result.err == nil && result.stop == acp.StopReasonCancelled {
+		result.err = errors.New("turn aborted")
+	}
+	if result.err != nil {
 		return acp.PromptResponse{}, acp.NewInternalError(map[string]any{"error": result.err.Error()})
 	}
 	usage := result.usage
@@ -566,17 +580,31 @@ func (r *Runtime) finishLocked(t *turnState, result turnResult) {
 		return
 	}
 	t.finished = true
+	result.clientCancelled = t.clientCancelled
 	if r.turn == t {
 		r.turn = nil
 	}
 	t.done <- result
 }
 
-// CancelTurn stops the model and the turn's tool calls without ending
-// coordinator.Run: Gate cancel, ops cancel, SIGKILL of recorded tool groups
-// after cancel-grace, synthesized failed updates, then the cancelled answer.
-// It is idempotent.
+// CancelTurn is the client's cancel (session/cancel, a cancelled prompt
+// request, SIGINT, session/close, shutdown): it aborts the turn and makes it
+// answer stopReason cancelled, even if the agent had already started its own
+// abort. It is idempotent.
 func (r *Runtime) CancelTurn() {
+	r.mu.Lock()
+	if t := r.turn; t != nil && !t.finished {
+		t.clientCancelled = true
+	}
+	r.mu.Unlock()
+	r.abortTurn()
+}
+
+// abortTurn stops the model and the turn's tool calls without ending
+// coordinator.Run: Gate cancel, ops cancel, SIGKILL of recorded tool groups
+// after cancel-grace, synthesized failed updates, then the answer. On its own
+// (agent-initiated) the turn answers its recorded error. It is idempotent.
+func (r *Runtime) abortTurn() {
 	r.mu.Lock()
 	t := r.turn
 	if t == nil || t.finished || t.cancelling {
@@ -584,7 +612,7 @@ func (r *Runtime) CancelTurn() {
 		return
 	}
 	t.cancelling = true
-	t.stop = acp.StopReasonCancelled
+	reason := abortReason(t)
 	r.refuseNew = true
 	outstanding := r.sync.Outstanding()
 	for id := range outstanding {
@@ -602,13 +630,22 @@ func (r *Runtime) CancelTurn() {
 	r.gate.CancelInflight()
 	for _, ids := range outstanding {
 		for _, id := range ids {
-			if err := r.ops.Cancel(id, "cancelled by the user"); err != nil {
+			if err := r.ops.Cancel(id, reason); err != nil {
 				r.log.Warn("cancel operation", "op", id, "err", err)
 			}
 		}
 	}
 	r.events.Push(event{kind: evWake})
 	time.AfterFunc(r.cfg.CancelGrace, func() { r.events.Push(event{kind: evCancelGrace, turn: t}) })
+}
+
+// abortReason says who aborted t, for tool results. Callers hold r.mu or
+// own t.
+func abortReason(t *turnState) string {
+	if t.clientCancelled {
+		return "Cancelled by the user"
+	}
+	return "Aborted: the model request failed"
 }
 
 // killToolGroups SIGKILLs every recorded tool process group. Unreal's own
@@ -704,7 +741,7 @@ func (r *Runtime) handle(ev event) {
 		}
 		r.mu.Unlock()
 		if t != nil && len(r.sync.Outstanding()) > 0 {
-			r.CancelTurn()
+			r.abortTurn()
 		}
 	case evRunExit:
 		r.mu.Lock()
@@ -737,6 +774,7 @@ func (r *Runtime) handle(ev event) {
 	case evCancelFlush:
 		r.mu.Lock()
 		var calls []string
+		reason := abortReason(ev.turn)
 		if r.turn == ev.turn {
 			for id := range ev.turn.waitCalls {
 				calls = append(calls, id)
@@ -749,7 +787,7 @@ func (r *Runtime) handle(ev event) {
 			if !r.reported[id] {
 				r.reported[id] = true
 				r.announce(id)
-				r.send(project.Failed(id, "Cancelled by the user."))
+				r.send(project.Failed(id, reason+"."))
 			}
 		}
 	}
