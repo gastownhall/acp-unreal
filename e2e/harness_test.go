@@ -225,6 +225,9 @@ func startAgent(t *testing.T, llm *fakeLLM, o agentOpts) *agentProc {
 	cmd.Env = append([]string{
 		"PATH=/usr/local/bin:/usr/bin:/bin", "HOME=" + filepath.Join(o.stateDir, "..", "home"), "LANG=C",
 		"ACP_UNREAL_E2E_MARKER=" + o.marker,
+		// The race runtime sleeps atexit_sleep_ms (default 1s) before every
+		// exit, which would hide shutdown latency behind a constant.
+		"GORACE=atexit_sleep_ms=0",
 	}, o.env...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	stdin, err := cmd.StdinPipe()
@@ -381,7 +384,8 @@ func (a *agentProc) clientDeath() {
 func (a *agentProc) terminate() {
 	a.t.Helper()
 	_ = syscall.Kill(a.cmd.Process.Pid, syscall.SIGTERM)
-	a.waitExit(10 * time.Second)
+	took := a.waitExit(10 * time.Second)
+	a.t.Logf("agent exited %s after SIGTERM", took.Round(time.Millisecond))
 }
 
 func (a *agentProc) waitExit(limit time.Duration) time.Duration {
@@ -390,7 +394,14 @@ func (a *agentProc) waitExit(limit time.Duration) time.Duration {
 	select {
 	case <-a.exited:
 	case <-time.After(limit):
-		a.t.Fatalf("agent did not exit within %s", limit)
+		// SIGQUIT makes the Go runtime dump every goroutine to stderr, so
+		// the failure log shows where shutdown is stuck.
+		_ = a.cmd.Process.Signal(syscall.SIGQUIT)
+		select {
+		case <-a.exited:
+		case <-time.After(5 * time.Second):
+		}
+		a.t.Fatalf("agent did not exit within %s (SIGQUIT goroutine dump in the agent stderr below)", limit)
 	}
 	return time.Since(start)
 }

@@ -1,6 +1,7 @@
 package e2e
 
 import (
+	"syscall"
 	"uuid"
 
 	"slices"
@@ -349,4 +350,65 @@ func TestModelFollowsLaunchFlagUnlessClientOverrides(t *testing.T) {
 		t.Fatalf("request after relaunch: model %q effort %q", got.Model, got.Effort)
 	}
 	c.stop()
+}
+
+// An idle agent shuts down on SIGTERM promptly: nothing to cancel, so
+// shutdown must not wait for --cancel-grace (1s in these tests).
+func TestIdleSigtermExitsWithoutWaitingForCancelGrace(t *testing.T) {
+	for name, prompts := range map[string][]string{
+		"after-text":     {"hello"},
+		"after-tool":     {"RUN[echo hi]"},
+		"after-both":     {"RUN[echo hi]", "hello"},
+		"never-prompted": nil,
+	} {
+		t.Run(name, func(t *testing.T) { idleSigterm(t, prompts) })
+	}
+}
+
+func idleSigterm(t *testing.T, prompts []string) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
+	a.initialize()
+	sid := a.newSession()
+	for _, p := range prompts {
+		a.prompt(sid, p)
+	}
+	start := time.Now()
+	if err := a.cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatal(err)
+	}
+	a.waitExit(10 * time.Second)
+	took := time.Since(start)
+	t.Logf("idle SIGTERM exit took %s", took.Round(time.Millisecond))
+	if a.exitErr != nil {
+		t.Fatalf("exit: %v", a.exitErr)
+	}
+	if took >= 900*time.Millisecond {
+		t.Fatalf("idle shutdown took %s; it waited for cancel-grace", took)
+	}
+}
+
+// --op-timeout ends even a TERM-ignoring command within op-timeout +
+// cancel-grace instead of the library's fixed 5s escalation.
+func TestOpTimeoutKillsTermIgnoringTool(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, args: []string{"--op-timeout", "500ms"}})
+	a.initialize()
+	sid := a.newSession()
+	start := time.Now()
+	resp := a.prompt(sid, `RUN[sh -c 'trap "" TERM; sleep 30']`)
+	took := time.Since(start)
+	t.Logf("prompt with a timed-out tool took %s", took.Round(time.Millisecond))
+	if resp.StopReason != acp.StopReasonEndTurn {
+		t.Fatalf("stopReason = %s", resp.StopReason)
+	}
+	if trace := toolTrace(a.client.snapshot()); len(trace) != 3 || !strings.HasPrefix(trace[2], "tool_call_update:failed:") {
+		t.Fatalf("trace = %q", trace)
+	}
+	if took > 3500*time.Millisecond {
+		t.Fatalf("the timed-out tool ended after %s (op-timeout 500ms + cancel-grace 1s)", took)
+	}
+	a.stop()
 }

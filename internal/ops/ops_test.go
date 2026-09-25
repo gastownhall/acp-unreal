@@ -166,3 +166,58 @@ func TestOpTimeoutCancelsForwardedOp(t *testing.T) {
 		t.Fatalf("cancels = %v", inner.cancels)
 	}
 }
+
+// A TERM-ignoring tool outlives inner.Cancel by the library's fixed 5s
+// escalation; after OpTimeout + KillGrace the op's process group is killed.
+func TestOpTimeoutKillsAfterGrace(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inner := newFakeInner()
+	killed := make(chan operation.ID, 4)
+	m := New(ctx, inner, Options{OpTimeout: 30 * time.Millisecond, KillGrace: 60 * time.Millisecond, Kill: func(id operation.ID) { killed <- id }})
+	start := time.Now()
+	_ = m.Add(shellOp(t, "stubborn"))
+	select {
+	case id := <-killed:
+		if id != "stubborn" {
+			t.Fatalf("killed %q", id)
+		}
+		if took := time.Since(start); took < 90*time.Millisecond {
+			t.Fatalf("killed after %s, before timeout + grace", took)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("op was never killed")
+	}
+}
+
+func TestOpTimeoutDoesNotKillAnOpThatEnded(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	inner := newFakeInner()
+	killed := make(chan operation.ID, 4)
+	m := New(ctx, inner, Options{OpTimeout: 30 * time.Millisecond, KillGrace: 60 * time.Millisecond, Kill: func(id operation.ID) { killed <- id }})
+	op := shellOp(t, "polite")
+	_ = m.Add(op)
+	// The op honours the cancel and ends within the grace.
+	waitCancel := time.Now().Add(2 * time.Second)
+	for {
+		inner.mu.Lock()
+		n := len(inner.cancels)
+		inner.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		if time.Now().After(waitCancel) {
+			t.Fatal("no cancel")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	op.Status = operation.StatusCanceled
+	inner.updates <- op
+	next(t, m)
+	select {
+	case id := <-killed:
+		t.Fatalf("killed %q after it ended", id)
+	case <-time.After(150 * time.Millisecond):
+	}
+}

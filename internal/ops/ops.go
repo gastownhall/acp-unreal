@@ -53,6 +53,12 @@ type Options struct {
 	Tap func(operation.Operation)
 	// OpTimeout bounds each forwarded op's wall clock (0 = unbounded).
 	OpTimeout time.Duration
+	// KillGrace is how long an op may take to end after its timeout cancel
+	// before Kill is called. The library's own TERM->KILL escalation waits a
+	// fixed 5s (primitives/process.go:31).
+	KillGrace time.Duration
+	// Kill forcibly ends an op that outlived OpTimeout + KillGrace.
+	Kill func(operation.ID)
 }
 
 type heldOp struct {
@@ -142,12 +148,29 @@ func (m *Manager) forward(op operation.Operation) error {
 	}
 	if m.opts.OpTimeout > 0 {
 		id, limit := op.ID, m.opts.OpTimeout
-		timer := time.AfterFunc(limit, func() {
-			_ = m.inner.Cancel(id, fmt.Sprintf("command exceeded the %s time limit", limit))
-		})
+		// Timers are registered under m.mu, which their callbacks take first,
+		// so a callback always sees its own registration.
 		m.mu.Lock()
-		m.timers[id] = timer
-		m.mu.Unlock()
+		defer m.mu.Unlock()
+		m.timers[id] = time.AfterFunc(limit, func() {
+			_ = m.inner.Cancel(id, fmt.Sprintf("command exceeded the %s time limit", limit))
+			if m.opts.Kill == nil {
+				return
+			}
+			m.mu.Lock()
+			defer m.mu.Unlock()
+			if _, running := m.timers[id]; running {
+				m.timers[id] = time.AfterFunc(m.opts.KillGrace, func() {
+					m.mu.Lock()
+					_, running := m.timers[id]
+					delete(m.timers, id)
+					m.mu.Unlock()
+					if running {
+						m.opts.Kill(id)
+					}
+				})
+			}
+		})
 	}
 	return nil
 }

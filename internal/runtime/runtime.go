@@ -239,6 +239,7 @@ func Open(parent context.Context, cfg Config, client Client, id session.ID, meta
 	r.opsCancel = opsCancel
 	r.ops = ops.New(opsCtx, operation.NewLocalOperationManager(opsCtx), ops.Options{
 		Policy: r.policy, Ask: r.enqueuePermission, Tap: r.tapOperation, OpTimeout: cfg.OpTimeout,
+		KillGrace: cfg.CancelGrace, Kill: r.killOperation,
 	})
 	adapter, err := cfg.NewAdapter(r.onDelta)
 	if err != nil {
@@ -619,6 +620,19 @@ func (r *Runtime) killToolGroups(why string) {
 	for _, pgid := range groups {
 		if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil {
 			r.log.Info("killed tool process group", "pgid", pgid, "why", why)
+		}
+	}
+}
+
+// killOperation SIGKILLs one operation's recorded tool process group (an op
+// that outlived --op-timeout + cancel-grace).
+func (r *Runtime) killOperation(id operation.ID) {
+	r.mu.Lock()
+	pgid := r.pgids[id]
+	r.mu.Unlock()
+	if pgid > 1 {
+		if err := syscall.Kill(-pgid, syscall.SIGKILL); err == nil {
+			r.log.Info("killed tool process group", "pgid", pgid, "why", "op-timeout")
 		}
 	}
 }
