@@ -169,6 +169,13 @@ func TestE4CancelKillsToolFlushesFailedAndMutesModel(t *testing.T) {
 	if live := liveInGroup(pgid); len(live) > 0 {
 		t.Fatalf("tool process group %d still has live members: %+v", pgid, live)
 	}
+	// The SIGKILL at cancel-grace must end the tool promptly: its real
+	// terminal status is reported, not the flush fallback's synthesized one.
+	for _, entry := range toolTrace(a.client.snapshot()) {
+		if entry == "tool_call_update:failed:Cancelled by the user." {
+			t.Fatalf("the killed tool never reported a terminal status; the flush fallback answered: %q", toolTrace(a.client.snapshot()))
+		}
+	}
 	time.Sleep(1500 * time.Millisecond)
 	if after := llm.Count(); after != before {
 		t.Fatalf("provider requests changed after cancel: %d -> %d", before, after)

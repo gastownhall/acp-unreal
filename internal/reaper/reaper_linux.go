@@ -98,13 +98,17 @@ func allProcs() []proc {
 	return out
 }
 
-// reapAdopted waits for exited children outside this process's session.
-// Tool leaders started by the library share this session (Setpgid only,
-// primitives/process.go:609) and are waited by os/exec, so they are never
-// touched; only adopted setsid escapees are reaped.
+// reapAdopted waits for exited children that this process adopted as a
+// subreaper. Tool leaders started by the library are process-group leaders
+// in this session (Setpgid only, primitives/process.go:609) and are waited
+// by os/exec, so they are never touched. Adopted children are everything
+// else: setsid escapees (another session) and members of a tool's process
+// group whose parent died first (not a group leader). The latter matter: a
+// zombie still counts as a group member, and the library keeps waiting for
+// a killed tool group until it is empty.
 func reapAdopted(own int) {
 	for _, child := range children() {
-		if child.state == "Z" && child.sid != own {
+		if child.state == "Z" && (child.sid != own || child.pid != child.pgid) {
 			var status syscall.WaitStatus
 			_, _ = syscall.Wait4(child.pid, &status, syscall.WNOHANG, nil)
 		}
