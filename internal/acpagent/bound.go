@@ -31,15 +31,17 @@ type Bound struct {
 	ID   session.ID
 }
 
-// ParentPIDEnv is exported to every tool of an acp-unreal process (value:
-// its pid). A process that sees it was started by another agent's tool, so
-// its GC_SESSION_ID is inherited ambient identity, not its own.
-const ParentPIDEnv = "ACP_UNREAL_PARENT_PID"
+// ParentGCSessionEnv is exported to every tool of an acp-unreal process
+// (value: that process's GC_SESSION_ID). A process whose GC_SESSION_ID equals
+// it inherited the identity from a parent agent, so the identity is not its
+// own. Any other GC_SESSION_ID (an agent of a gc city a tool started, whose
+// controller passes the leaked marker along) is bound normally.
+const ParentGCSessionEnv = "ACP_UNREAL_PARENT_GC_SESSION_ID"
 
 // ResolveBound applies the priority GC_SESSION_ID > --session-id > --resume.
-// GC_SESSION_ID is ignored under a parent acp-unreal (ParentPIDEnv set).
+// A GC_SESSION_ID inherited from a parent acp-unreal is ignored.
 func ResolveBound(getenv func(string) string, sessionIDFlag, resumeFlag string) (Bound, error) {
-	if raw := getenv("GC_SESSION_ID"); raw != "" && getenv(ParentPIDEnv) == "" {
+	if raw := getenv("GC_SESSION_ID"); raw != "" && raw != getenv(ParentGCSessionEnv) {
 		return Bound{Mode: BoundGC, ID: GCSessionID(raw, getenv("GC_CONTINUATION_EPOCH"))}, nil
 	}
 	if sessionIDFlag != "" {

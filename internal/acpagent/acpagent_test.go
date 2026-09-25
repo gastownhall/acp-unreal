@@ -98,10 +98,10 @@ func TestInsideDir(t *testing.T) {
 
 // A nested acp-unreal started by one of this agent's tools inherits
 // GC_SESSION_ID; binding to it would collide with the parent ("session
-// busy"). The parent marks its tools with ParentPIDEnv, and a marked
-// process ignores the ambient gc identity.
+// busy"). The parent exports its own GC_SESSION_ID as ParentGCSessionEnv,
+// and a process whose GC_SESSION_ID equals it ignores that ambient identity.
 func TestResolveBoundIgnoresAmbientGCIdentityUnderAParentAgent(t *testing.T) {
-	nested := env(map[string]string{"GC_SESSION_ID": "s1", "GC_CONTINUATION_EPOCH": "2", ParentPIDEnv: "4242"})
+	nested := env(map[string]string{"GC_SESSION_ID": "s1", "GC_CONTINUATION_EPOCH": "2", ParentGCSessionEnv: "s1"})
 	b, err := ResolveBound(nested, "", "")
 	if err != nil || b.Mode != Unbound {
 		t.Fatalf("nested agent bound to the parent's gc session: %+v %v", b, err)
@@ -109,5 +109,16 @@ func TestResolveBoundIgnoresAmbientGCIdentityUnderAParentAgent(t *testing.T) {
 	b, _ = ResolveBound(nested, "K", "")
 	if b.Mode != BoundCreate || b.ID != "K" {
 		t.Fatalf("explicit --session-id must still apply: %+v", b)
+	}
+}
+
+// The parent marker leaks through anything a tool starts, including a gc
+// controller, which passes its whole environment to its agents. Those agents
+// have their own GC_SESSION_ID and must bind to it.
+func TestResolveBoundBindsOwnGCIdentityDespiteALeakedParentMarker(t *testing.T) {
+	agent := env(map[string]string{"GC_SESSION_ID": "nested-city-s9", "GC_CONTINUATION_EPOCH": "1", ParentGCSessionEnv: "s1"})
+	b, err := ResolveBound(agent, "", "")
+	if err != nil || b.Mode != BoundGC || b.ID != GCSessionID("nested-city-s9", "1") {
+		t.Fatalf("agent of a nested city did not bind to its own gc session: %+v %v", b, err)
 	}
 }

@@ -70,9 +70,10 @@ The first successful `session/new` of a process is bound. Checked in this order:
    `gc-<sanitize(GC_SESSION_ID)>-e<GC_CONTINUATION_EPOCH|1>`. The session is opened if
    it exists and created otherwise, with no replay. A gc restart resumes the
    conversation, and `gc session reset` bumps the epoch, which starts a fresh session.
-   `GC_SESSION_ID` is ignored when `ACP_UNREAL_PARENT_PID` is set. `acp-unreal`
-   exports that variable to its tools, so an `acp-unreal` started by a tool does not
-   try to bind to its parent's session.
+   `acp-unreal` exports its own `GC_SESSION_ID` to its tools as
+   `ACP_UNREAL_PARENT_GC_SESSION_ID`, and ignores a `GC_SESSION_ID` equal to that
+   value: an `acp-unreal` started by a tool does not try to bind to its parent's
+   session, but an agent of a gc city that a tool started binds to its own.
 2. **`--session-id K`.** Create K. It is an error if K exists.
 3. **`--resume K`.** Open K without replay. If K is missing, the process prints
    `unknown session` and exits with code 3 before it answers `initialize`.
@@ -310,7 +311,7 @@ add `--permission-mode ask` to the agent command line to be asked.
 | symptom | cause and fix |
 |---|---|
 | `--state-dir ... is inside the working directory` | move the state dir out of the workspace (the default under `$XDG_STATE_HOME` is fine) |
-| `session busy` | another process holds the session lock. Under gc, a nested `acp-unreal` without `ACP_UNREAL_PARENT_PID` would hit this; current versions set it for tools |
+| `session busy` | another process holds the session lock, for example a second `acp-unreal` started with the same `GC_SESSION_ID` and epoch, or with the same `--session-id` |
 | `unknown session`, exit code 3 | `--resume K` names a session that does not exist in this state dir |
 | `--api-key-file ... must not be accessible by group or others` | `chmod 600` the key file |
 | a permission request is never answered under gc | the running gc does not serve `session/request_permission` yet; use `--permission-mode auto` or set `--permission-timeout` |

@@ -447,12 +447,12 @@ func TestE9CredentialScrubCoversOwnAndParentEnviron(t *testing.T) {
 	}})
 	a.initialize()
 	sid := a.newSession()
-	a.prompt(sid, `RUN[echo own=$(env | grep -c dummy-key) parent=$(tr '\0' '\n' </proc/$PPID/environ | grep -c dummy-key) $GC_INSTANCE_TOKEN pp=$ACP_UNREAL_PARENT_PID]`)
+	a.prompt(sid, `RUN[echo own=$(env | grep -c dummy-key) parent=$(tr '\0' '\n' </proc/$PPID/environ | grep -c dummy-key) $GC_INSTANCE_TOKEN pp=$ACP_UNREAL_PARENT_GC_SESSION_ID]`)
 	trace := toolTrace(a.client.snapshot())
 	if len(trace) != 3 {
 		t.Fatalf("trace = %q", trace)
 	}
-	if out := trace[2]; !strings.Contains(out, fmt.Sprintf("own=0 parent=0 gc-tok-kept pp=%d", a.cmd.Process.Pid)) {
+	if out := trace[2]; !strings.Contains(out, "own=0 parent=0 gc-tok-kept pp=gc-test") {
 		t.Fatalf("tool output = %q", out)
 	}
 	if n := environHits(t, a.cmd.Process.Pid, "dummy-key"); n != 0 {
@@ -535,4 +535,25 @@ func TestPositionalArgumentsAreRefused(t *testing.T) {
 	if code := a.cmd.ProcessState.ExitCode(); code != 2 || !strings.Contains(a.stderr.String(), "positional") {
 		t.Fatalf("positional argument: exit %d stderr %q", code, a.stderr.String())
 	}
+}
+
+// A nested acp-unreal started by a tool ignores the GC_SESSION_ID it
+// inherited from this agent, but binds to a GC_SESSION_ID of its own (the
+// case of an agent in a gc city whose controller a tool started).
+func TestNestedAgentBindsOnlyToItsOwnGCSession(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws, env: []string{"GC_SESSION_ID=outer-s", "GC_CONTINUATION_EPOCH=1"}})
+	a.initialize()
+	sid := a.newSession()
+	nested := fmt.Sprintf("%s --base-url %s --model fake-1 --state-dir %s </dev/null 2>&1 | grep -c 'bound mode'", agentBin, llm.baseURL(), filepath.Join(filepath.Dir(state), "nested-state"))
+	a.prompt(sid, "RUN[echo inherited=$("+nested+") own=$(GC_SESSION_ID=nested-city-s "+nested+")]")
+	trace := toolTrace(a.client.snapshot())
+	if len(trace) != 3 {
+		t.Fatalf("trace = %q", trace)
+	}
+	if out := trace[2]; !strings.Contains(out, "inherited=0 own=1") {
+		t.Fatalf("tool output = %q, want the inherited identity ignored and an own one bound", out)
+	}
+	a.stop()
 }

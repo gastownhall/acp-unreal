@@ -12,7 +12,6 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime/debug"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -53,6 +52,15 @@ const (
 // sweepGrace is how long escaped tool descendants get between SIGTERM and
 // SIGKILL at shutdown; it runs after the shutdown budget, inside gc's 5s.
 const sweepGrace = 500 * time.Millisecond
+
+// exportParentGCSession sets ParentGCSessionEnv for tools to this process's
+// GC_SESSION_ID, or removes an inherited value when there is none.
+func exportParentGCSession(gcSession string) error {
+	if gcSession == "" {
+		return os.Unsetenv(acpagent.ParentGCSessionEnv)
+	}
+	return os.Setenv(acpagent.ParentGCSessionEnv, gcSession)
+}
 
 func envOr(name, fallback string) string {
 	if v := os.Getenv(name); v != "" {
@@ -181,10 +189,10 @@ func run() int {
 	if err != nil {
 		return usage("%v", err)
 	}
-	// Mark every tool this process starts, so a nested acp-unreal does not
-	// bind to this process's inherited gc session.
-	if err := os.Setenv(acpagent.ParentPIDEnv, strconv.Itoa(os.Getpid())); err != nil {
-		logger.Error("export "+acpagent.ParentPIDEnv, "err", err)
+	// Tell every tool this process starts which gc identity is ambient, so
+	// a nested acp-unreal does not bind to this process's gc session.
+	if err := exportParentGCSession(os.Getenv("GC_SESSION_ID")); err != nil {
+		logger.Error("export "+acpagent.ParentGCSessionEnv, "err", err)
 		return 1
 	}
 	if bound.Mode == acpagent.BoundResume && !layout.Exists(bound.ID) {
