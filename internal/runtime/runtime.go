@@ -546,7 +546,9 @@ func (r *Runtime) Prompt(ctx context.Context, text string, messageID *string) (a
 }
 
 func (result turnResult) response(id string) (acp.PromptResponse, error) {
-	if result.err != nil {
+	// A cancelled turn always answers cancelled (ACP prompt-turn: the agent
+	// MUST NOT surface abort errors); an earlier provider error was logged.
+	if result.err != nil && result.stop != acp.StopReasonCancelled {
 		return acp.PromptResponse{}, acp.NewInternalError(map[string]any{"error": result.err.Error()})
 	}
 	usage := result.usage
@@ -705,7 +707,11 @@ func (r *Runtime) handle(ev event) {
 		}
 		t := r.turn
 		if ev.err != nil && !errors.Is(ev.err, context.Canceled) && t != nil {
-			r.finishLocked(t, turnResult{err: fmt.Errorf("coordinator stopped: %w", ev.err)})
+			result := turnResult{err: fmt.Errorf("coordinator stopped: %w", ev.err), usage: t.usage, model: t.model}
+			if t.cancelling {
+				result.stop = acp.StopReasonCancelled
+			}
+			r.finishLocked(t, result)
 		}
 		r.mu.Unlock()
 		if ev.err != nil && !errors.Is(ev.err, context.Canceled) {
