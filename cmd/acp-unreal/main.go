@@ -102,6 +102,13 @@ func main() {
 }
 
 func run() int {
+	// When the client dies, stdin reaches EOF and stdout AND stderr break at
+	// the same moment. Go's default SIGPIPE disposition for fd 1/2 would kill
+	// the process on its next log line, before shutdown drains and kills the
+	// tools. Catching SIGPIPE makes those writes fail with EPIPE instead.
+	// Notify (a caught handler) rather than signal.Ignore: SIG_IGN would be
+	// inherited by every tool across exec.
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
 	o := parseFlags()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
 

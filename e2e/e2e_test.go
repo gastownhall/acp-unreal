@@ -404,6 +404,28 @@ func TestE8StdinEOFShutdownLeavesNoOrphans(t *testing.T) {
 	}
 }
 
+// E8b: the client dies (stdin EOF plus broken stdout AND stderr, which is
+// what every ACP agent sees when gc dies) during a TERM-ignoring tool: the
+// agent must not die of SIGPIPE before its graceful shutdown kills the tool.
+func TestE8bClientDeathLeavesNoOrphans(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
+	a.initialize()
+	sid := a.newSession()
+	_, pgid := startTermIgnoringTool(t, a, sid)
+	a.clientDeath()
+	took := a.waitExit(4*time.Second + time.Second)
+	t.Logf("agent exited %s after client death (exit %v)", took.Round(time.Millisecond), a.exitErr)
+	if a.exitErr != nil {
+		t.Fatalf("exit status: %v", a.exitErr)
+	}
+	waitFor(t, 2*time.Second, "tool group gone", func() bool { return len(liveInGroup(pgid)) == 0 })
+	if live := markedProcs(a.opts.marker, -1); len(live) > 0 {
+		t.Fatalf("processes carrying the marker env survive: %+v", live)
+	}
+}
+
 // E9: targeted env scrub: the API key is gone, GC_* is kept.
 func TestE9EnvScrubKeepsGCVars(t *testing.T) {
 	llm := newFakeLLM(t)

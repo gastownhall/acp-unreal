@@ -199,11 +199,15 @@ type agentProc struct {
 	conn    *acp.ClientSideConnection
 	client  *recorder
 	stdin   io.WriteCloser
-	tee     *lineTee
-	stderr  *syncBuffer
-	exited  chan struct{}
-	exitErr error
-	opts    agentOpts
+	stdout  io.ReadCloser
+	stderrR *os.File
+	// stderrDone closes when the stderr copier sees EOF.
+	stderrDone chan struct{}
+	tee        *lineTee
+	stderr     *syncBuffer
+	exited     chan struct{}
+	exitErr    error
+	opts       agentOpts
 }
 
 var secretPattern = regexp.MustCompile(`(?i)bearer|api_key|authorization`)
@@ -231,18 +235,35 @@ func startAgent(t *testing.T, llm *fakeLLM, o agentOpts) *agentProc {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// stderr is an os.Pipe drained by a goroutine, as gc wires it
+	// (internal/runtime/acp/acp.go), so a test can break it like a dying
+	// client does.
+	stderrR, stderrW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	stderr := &syncBuffer{}
-	cmd.Stderr = stderr
+	cmd.Stderr = stderrW
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
 	}
+	stderrW.Close()
+	stderrDone := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(stderr, stderrR)
+		close(stderrDone)
+	}()
 	t.Logf("started acp-unreal pid=%d", cmd.Process.Pid)
 	tee := &lineTee{r: stdout}
 	client := &recorder{}
-	a := &agentProc{t: t, cmd: cmd, client: client, stdin: stdin, tee: tee, stderr: stderr, exited: make(chan struct{}), opts: o}
+	a := &agentProc{t: t, cmd: cmd, client: client, stdin: stdin, stdout: stdout, stderrR: stderrR, stderrDone: stderrDone, tee: tee, stderr: stderr, exited: make(chan struct{}), opts: o}
 	a.conn = acp.NewClientSideConnection(client, stdin, tee)
 	go func() {
 		a.exitErr = cmd.Wait()
+		select {
+		case <-stderrDone:
+		case <-time.After(2 * time.Second): // a leaked tool may hold the pipe
+		}
 		close(a.exited)
 	}()
 	t.Cleanup(func() {
@@ -345,6 +366,16 @@ func (a *agentProc) stop() {
 	a.t.Helper()
 	a.stdin.Close()
 	a.waitExit(10 * time.Second)
+}
+
+// clientDeath models the owner process dying: stdin reaches EOF and the
+// read ends of stdout and stderr close at the same moment, so the agent's
+// next write to fd 1 or fd 2 fails with EPIPE (or kills it by SIGPIPE).
+func (a *agentProc) clientDeath() {
+	a.t.Helper()
+	a.stdin.Close()
+	a.stdout.Close()
+	a.stderrR.Close()
 }
 
 func (a *agentProc) terminate() {
