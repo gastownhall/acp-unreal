@@ -30,7 +30,7 @@ import (
 
 // version is the release; `go install ...@vX.Y.Z` builds report the module
 // version instead (see buildVersion).
-const version = "0.1.0"
+const version = "0.1.1"
 
 // releaseVersion matches a tagged module version (not a VCS pseudo-version).
 var releaseVersion = regexp.MustCompile(`^v\d+\.\d+\.\d+$`)

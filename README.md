@@ -17,7 +17,7 @@ stdout carries only JSON-RPC. Logs go to stderr.
 ## Install
 
 ```sh
-go install github.com/gastownhall/acp-unreal/cmd/acp-unreal@v0.1.0
+go install github.com/gastownhall/acp-unreal/cmd/acp-unreal@v0.1.1
 acp-unreal --version
 ```
 
@@ -163,6 +163,12 @@ session in this process.
 No tokens are spent after a cancel until the next prompt. The requests that would only
 answer the cancelled calls are muted.
 
+`cancelled` is reserved for the client's own cancel. When a model request fails while
+tool calls are still running, `acp-unreal` aborts those calls the same way (their
+results say `Aborted: the model request failed`) and answers the prompt with a
+JSON-RPC `-32603` error carrying the provider message, unless the client cancels
+before the turn ends.
+
 ## Signals and shutdown
 
 | event | effect |
@@ -251,19 +257,21 @@ gc start
 
 ### Which gc version
 
-Basic sessions (start, prompt, streamed output, restart that resumes, reset that
-starts fresh) work with current gc. Some features need gc changes that are in review:
+The pack is checked against gc `main` (`gc config show` loads it, and gc renders the
+launch command with every pack option). A full gc-driven session (create, prompt,
+streamed output, restart that resumes, reset that starts fresh) has not yet been
+verified end to end for this release. Some features need gc changes:
 
 | feature | gc change | without it |
 |---|---|---|
-| tool approvals in `ask` mode (pending interaction + respond) | `session/request_permission` as a pending interaction (a1b, PR pending) | use `permission_mode = "auto"`; gc cannot answer the request |
-| gc answers agent requests it does not serve | `-32601` for unsupported agent requests (a1a, PR pending) | a request gc drops is never answered |
-| a `/stop` or interrupt that waits for the turn to settle | `session/cancel` interrupt (a3a) and settling `/stop` (c3), PRs pending | gc's SIGINT is a cooperative cancel: the turn is answered `cancelled`, but gc does not wait for it |
-| turn completion and idle waits | a2a, PR pending | |
-| configurable stop grace | [#6542](https://github.com/gastownhall/gascity/pull/6542) | gc SIGKILLs after 5s; keep `--shutdown-budget` below it |
-| transcripts | [#6544](https://github.com/gastownhall/gascity/pull/6544) (capture) and a4b (read), PR pending | no gc transcript for ACP sessions |
-| orphan sweep after an agent crash | [#6543](https://github.com/gastownhall/gascity/pull/6543) | tools of a SIGKILLed agent survive |
-| session reset over the API | [#6593](https://github.com/gastownhall/gascity/pull/6593) | use `gc session reset` |
+| tool approvals in `ask` mode (pending interaction + respond) | `session/request_permission` as a pending interaction (planned, no PR yet) | use `permission_mode = "auto"`; otherwise the request is rejected after `permission_timeout` |
+| gc answers agent requests it does not serve | `-32601` for unsupported agent requests (planned, no PR yet) | a request gc drops is never answered |
+| a `/stop` or interrupt that waits for the turn to settle | `session/cancel` interrupt and a settling `/stop` (planned, no PRs yet) | gc's SIGINT is a cooperative cancel: the turn is answered `cancelled`, but gc does not wait for it |
+| turn completion and idle waits | ACP turn-completion signal (planned, no PR yet) | gc cannot tell when an ACP turn ended |
+| configurable stop grace | [#6542](https://github.com/gastownhall/gascity/pull/6542) (merged) | gc SIGKILLs after 5s; keep `--shutdown-budget` below it |
+| transcripts | [#6544](https://github.com/gastownhall/gascity/pull/6544) (capture, in review); reading it back is planned | no gc transcript for ACP sessions |
+| orphan sweep after an agent crash | [#6543](https://github.com/gastownhall/gascity/pull/6543) (in review) | tools of a SIGKILLed agent survive |
+| session reset over the API | [#6593](https://github.com/gastownhall/gascity/pull/6593) (in review) | use `gc session reset` |
 
 ## Other ACP clients
 
@@ -316,7 +324,8 @@ add `--permission-mode ask` to the agent command line to be asked.
 | `session busy` | another process holds the session lock, for example a second `acp-unreal` started with the same `GC_SESSION_ID` and epoch, or with the same `--session-id` |
 | `unknown session`, exit code 3 | `--resume K` names a session that does not exist in this state dir |
 | `--api-key-file ... must not be accessible by group or others` | `chmod 600` the key file |
-| a permission request is never answered under gc | the running gc does not serve `session/request_permission` yet; use `--permission-mode auto` or set `--permission-timeout` |
+| a permission request is never answered under gc | the running gc does not serve `session/request_permission` yet. The pack's `permission_timeout` (default `10m`) rejects the command when it expires; use `permission_mode = "auto"` to avoid the wait |
+| a gc session's initial message is ignored, or the agent exits 2 with `unexpected positional arguments` | the provider has `prompt_mode` other than `"none"`, so gc appended the message to the command. Use the shipped pack, or set `prompt_mode = "none"` |
 | provider errors | the prompt is answered with a JSON-RPC error after `--max-attempts`; the session stays usable. stderr has the provider message (never the key) |
 
 ## Development
