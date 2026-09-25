@@ -1,0 +1,206 @@
+// Command acp-unreal is an ACP v1 agent over stdio that hosts Unreal Agent
+// (github.com/unreallabsai/unreal-agent v0.1.1) sessions in one long-lived
+// process. stdout carries only JSON-RPC; logs go to stderr.
+package main
+
+import (
+	"flag"
+	"fmt"
+	"log/slog"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	acp "github.com/coder/acp-go-sdk"
+
+	"github.com/unreallabsai/unreal-agent/harness/llm"
+	"github.com/unreallabsai/unreal-agent/harness/llm/responsesapi"
+	"github.com/unreallabsai/unreal-agent/harness/primitives"
+
+	"github.com/gastownhall/acp-unreal/internal/acpagent"
+	"github.com/gastownhall/acp-unreal/internal/runtime"
+	"github.com/gastownhall/acp-unreal/internal/tap"
+)
+
+const version = "0.1.0-spike"
+
+// Exit codes.
+const (
+	exitUsage          = 2
+	exitUnknownSession = 3
+)
+
+// scrubbedCredentialVars are removed from the process environment after the
+// key is read: Bash children inherit the full environment
+// (operation/shell.go:519-532, primitives/process.go:608). GC_* and BEADS_*
+// are deliberately kept -- the agent's tools legitimately need them.
+var scrubbedCredentialVars = []string{"UNREAL_HARNESS_LLM_API_KEY", "OPENAI_API_KEY", "OPENROUTER_API_KEY", "OLLAMA_API_KEY"}
+
+func envOr(name, fallback string) string {
+	if v := os.Getenv(name); v != "" {
+		return v
+	}
+	return fallback
+}
+
+func defaultStateDir() string {
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+		return filepath.Join(dir, "acp-unreal")
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".local", "state", "acp-unreal")
+}
+
+func splitCSV(s string) []string {
+	var out []string
+	for _, part := range strings.Split(s, ",") {
+		if part = strings.TrimSpace(part); part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+type options struct {
+	baseURL, model, models, apiKeyEnv, stateDir, permissionMode, allow, shell, systemPrompt string
+	sessionID, resume                                                                       string
+	permissionTimeout, cancelGrace, shutdownBudget, opTimeout                               time.Duration
+	contextWindow, maxUpdateText, maxAttempts                                               int
+	promptCacheKey                                                                          bool
+}
+
+func parseFlags() options {
+	var o options
+	flag.StringVar(&o.baseURL, "base-url", os.Getenv("ACP_UNREAL_BASE_URL"), "OpenAI Responses-compatible base URL (env ACP_UNREAL_BASE_URL)")
+	flag.StringVar(&o.model, "model", os.Getenv("ACP_UNREAL_MODEL"), "default model id (env ACP_UNREAL_MODEL)")
+	flag.StringVar(&o.models, "models", "", "comma-separated models offered as the model config option")
+	flag.StringVar(&o.apiKeyEnv, "api-key-env", "ACP_UNREAL_API_KEY", "NAME of the env var holding the provider API key (read, then unset)")
+	flag.StringVar(&o.stateDir, "state-dir", defaultStateDir(), "session store, meta, locks and tool output; must be outside the workspace")
+	flag.StringVar(&o.permissionMode, "permission-mode", "auto", "auto | ask | allowlist")
+	flag.StringVar(&o.allow, "allow", "", "comma-separated command prefixes auto-allowed in allowlist mode")
+	flag.DurationVar(&o.permissionTimeout, "permission-timeout", 0, "max wait for session/request_permission (0 = forever; expiry = reject_once)")
+	flag.StringVar(&o.shell, "shell", "/bin/bash", "absolute shell for the Bash tool (never $SHELL)")
+	flag.StringVar(&o.systemPrompt, "system-prompt", "", "system prompt (default: a short coding-agent preamble)")
+	flag.DurationVar(&o.cancelGrace, "cancel-grace", time.Second, "wait after cancel before SIGKILLing tool process groups")
+	flag.DurationVar(&o.shutdownBudget, "shutdown-budget", 4*time.Second, "graceful shutdown budget; keep below the owner's SIGKILL grace (gc: 5s)")
+	flag.IntVar(&o.contextWindow, "context-window", 131072, "context window reported in usage_update")
+	flag.IntVar(&o.maxUpdateText, "max-update-text", 16384, "max bytes of text per session/update chunk or tool result")
+	flag.DurationVar(&o.opTimeout, "op-timeout", 0, "per-Bash wall clock (0 = unbounded)")
+	flag.IntVar(&o.maxAttempts, "max-attempts", 3, "provider attempts per model request")
+	flag.BoolVar(&o.promptCacheKey, "prompt-cache-key", false, "send the session id as prompt_cache_key")
+	flag.StringVar(&o.sessionID, "session-id", "", "bound mode: create this session id on the first session/new (error if it exists)")
+	flag.StringVar(&o.resume, "resume", "", "bound mode: open this existing session id on the first session/new, without replay")
+	flag.Parse()
+	return o
+}
+
+func main() {
+	os.Exit(run())
+}
+
+func run() int {
+	o := parseFlags()
+	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	apiKey := os.Getenv(o.apiKeyEnv)
+	for _, name := range append([]string{o.apiKeyEnv}, scrubbedCredentialVars...) {
+		_ = os.Unsetenv(name)
+	}
+	usage := func(format string, args ...any) int {
+		fmt.Fprintf(os.Stderr, "acp-unreal: "+format+"\n", args...)
+		return exitUsage
+	}
+	if o.baseURL == "" || o.model == "" {
+		return usage("--base-url and --model (or ACP_UNREAL_BASE_URL / ACP_UNREAL_MODEL) are required")
+	}
+	mode := runtime.PermissionMode(o.permissionMode)
+	switch mode {
+	case runtime.PermissionAuto, runtime.PermissionAsk, runtime.PermissionAllowlist:
+	default:
+		return usage("--permission-mode must be auto, ask or allowlist")
+	}
+	if !filepath.IsAbs(o.shell) {
+		return usage("--shell must be an absolute path")
+	}
+	stateDir, err := filepath.Abs(o.stateDir)
+	if err != nil {
+		return usage("--state-dir: %v", err)
+	}
+	if cwd, err := os.Getwd(); err == nil {
+		if rel, err := filepath.Rel(cwd, stateDir); err == nil && (rel == "." || !strings.HasPrefix(rel, "..")) {
+			return usage("--state-dir %s is inside the working directory %s; keep agent state out of the workspace", stateDir, cwd)
+		}
+	}
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		logger.Error("create state dir", "err", err)
+		return 1
+	}
+	layout := runtime.Layout{Root: stateDir}
+	bound, err := acpagent.ResolveBound(os.Getenv, o.sessionID, o.resume)
+	if err != nil {
+		return usage("%v", err)
+	}
+	if bound.Mode == acpagent.BoundResume && !layout.Exists(bound.ID) {
+		fmt.Fprintf(os.Stderr, "acp-unreal: unknown session %s\n", bound.ID)
+		return exitUnknownSession
+	}
+	if bound.Mode != acpagent.Unbound {
+		logger.Info("bound mode", "session", string(bound.ID), "mode", int(bound.Mode))
+	}
+
+	baseURL, attempts, cacheKey := strings.TrimRight(o.baseURL, "/"), o.maxAttempts, o.promptCacheKey
+	newAdapter := func(sink func(tap.Delta)) (llm.Adapter, error) {
+		headers := map[string][]string{"Content-Type": {"application/json"}}
+		if apiKey != "" {
+			headers["Authorization"] = []string{"Bearer " + apiKey}
+		}
+		return responsesapi.NewAdapter(primitives.NewRemoteClientWithHTTPClient(tap.NewHTTPClient(sink)), responsesapi.Config{
+			Endpoint:          baseURL + "/responses",
+			Headers:           headers,
+			MaxAttempts:       &attempts,
+			CacheKeyPlacement: responsesapi.CacheKeyPlacement{UsePromptCacheKeyField: cacheKey},
+		})
+	}
+	agent := acpagent.New(acpagent.Config{
+		Runtime: runtime.Config{
+			Layout: layout, Shell: o.shell, SystemPrompt: o.systemPrompt,
+			PermissionMode: mode, Allow: splitCSV(o.allow), PermissionTimeout: o.permissionTimeout,
+			CancelGrace: o.cancelGrace, ContextWindow: o.contextWindow, MaxUpdateText: o.maxUpdateText,
+			OpTimeout: o.opTimeout, NewAdapter: newAdapter, Log: logger,
+		},
+		DefaultModel: o.model, Models: splitCSV(o.models), Bound: bound,
+		ShutdownBudget: o.shutdownBudget, Version: version,
+	})
+	// The SDK logs via slog.Default() when no logger is set. Connection.
+	// SetLogger is unsynchronized with the reader goroutine the constructor
+	// starts (acp-go-sdk connection.go:125 vs :128), so set the default
+	// instead of calling it.
+	slog.SetDefault(logger)
+	conn := acp.NewAgentSideConnection(agent, os.Stdout, os.Stdin)
+	agent.SetClient(conn)
+
+	signals := make(chan os.Signal, 4)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM, syscall.SIGHUP)
+	for {
+		select {
+		case sig := <-signals:
+			if sig == syscall.SIGINT {
+				// gc's ACP Interrupt sends SIGINT to the agent's process group:
+				// cancel in place and stay alive (gc interrupt_now relies on it).
+				logger.Info("SIGINT: cancelling active turns")
+				agent.CancelAllTurns()
+				continue
+			}
+			logger.Info("shutting down", "signal", sig.String())
+			agent.Shutdown()
+			return 0
+		case <-conn.Done():
+			logger.Info("client disconnected; shutting down")
+			agent.Shutdown()
+			return 0
+		}
+	}
+}
