@@ -14,9 +14,9 @@ package gate
 
 import (
 	"context"
-	"fmt"
 	"strings"
 	"sync"
+	"uuid"
 
 	"github.com/unreallabsai/unreal-agent/harness/llm"
 
@@ -70,6 +70,7 @@ type Gate struct {
 	partialAttempt map[uint64]int
 	records        map[string]Record
 	served         map[uint64]string
+	created        map[uint64]string
 	providerCalls  int
 }
 
@@ -87,7 +88,7 @@ func New(inner llm.Adapter, opts Options) *Gate {
 		inner: inner, opts: opts,
 		parkedCalls: map[string]bool{}, parkedInputs: map[string]bool{},
 		partial: map[uint64]*strings.Builder{}, partialAttempt: map[uint64]int{},
-		records: map[string]Record{}, served: map[uint64]string{},
+		records: map[string]Record{}, served: map[uint64]string{}, created: map[uint64]string{},
 	}
 }
 
@@ -151,6 +152,8 @@ func (g *Gate) ObserveDelta(d tap.Delta) {
 		g.partial[d.Seq].WriteString(d.Text)
 	case tap.Model:
 		g.served[d.Seq] = d.Text
+	case tap.Created:
+		g.created[d.Seq] = d.Text
 	}
 }
 
@@ -185,7 +188,7 @@ func (g *Gate) Respond(ctx context.Context, request llm.Request, options llm.Req
 	seq := g.seq
 	if g.parked {
 		if g.allParkedLocked(reasons) {
-			id := fmt.Sprintf("acp-unreal-muted-%d", seq)
+			id := syntheticID("muted")
 			g.records[id] = Record{Seq: seq, Outcome: Muted}
 			g.mu.Unlock()
 			return llm.Response{ID: id, Stop: llm.StopComplete}, nil
@@ -218,6 +221,8 @@ func (g *Gate) Respond(ctx context.Context, request llm.Request, options llm.Req
 	delete(g.partialAttempt, seq)
 	served := g.served[seq]
 	delete(g.served, seq)
+	created := g.created[seq]
+	delete(g.created, seq)
 	if served == "" {
 		served = model
 	}
@@ -229,7 +234,12 @@ func (g *Gate) Respond(ctx context.Context, request llm.Request, options llm.Req
 		// result (loop.go:153-156).
 		return llm.Response{}, ctx.Err()
 	case stopped:
-		id := fmt.Sprintf("acp-unreal-cancel-%d", seq)
+		// Keep the provider's id so the partial text replays under the
+		// messageId it streamed with.
+		id := created
+		if id == "" {
+			id = syntheticID("cancel")
+		}
 		var output []llm.Item
 		if partial != "" {
 			output = []llm.Item{{Type: llm.ItemMessage, Data: llm.Message{Role: llm.RoleAssistant, Text: partial}}}
@@ -237,17 +247,27 @@ func (g *Gate) Respond(ctx context.Context, request llm.Request, options llm.Req
 		g.remember(id, Record{Seq: seq, Outcome: Cancelled, Model: served})
 		return llm.Response{ID: id, Stop: llm.StopComplete, Output: output}, nil
 	case err != nil:
-		id := fmt.Sprintf("acp-unreal-error-%d", seq)
+		id := syntheticID("error")
 		g.remember(id, Record{Seq: seq, Outcome: Errored, Model: served})
 		g.opts.OnError(seq, err)
 		return llm.Response{ID: id, Stop: llm.StopComplete}, nil
 	default:
 		if response.ID == "" {
-			response.ID = fmt.Sprintf("acp-unreal-%d", seq)
+			response.ID = created
+		}
+		if response.ID == "" {
+			response.ID = syntheticID("response")
 		}
 		g.remember(response.ID, Record{Seq: seq, Outcome: Provider, Model: served})
 		return response, nil
 	}
+}
+
+// syntheticID names a response the provider did not produce. It is
+// persisted as Response.ID and must be unique across processes, because
+// ACP message ids derive from it.
+func syntheticID(kind string) string {
+	return "acp-unreal-" + kind + "-" + uuid.NewV4().String()
 }
 
 func (g *Gate) remember(id string, record Record) {

@@ -1,6 +1,8 @@
 package e2e
 
 import (
+	"uuid"
+
 	"slices"
 	"strings"
 	"testing"
@@ -110,6 +112,136 @@ func TestAllowlistAndPermissionTimeout(t *testing.T) {
 	}
 	if exists(marker) {
 		t.Fatal("timed-out command ran")
+	}
+	a.stop()
+}
+
+// messageIDs returns the agent message ids of updates in order of first use.
+func agentMessageIDs(updates []acp.SessionUpdate) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, u := range updates {
+		if c := u.AgentMessageChunk; c != nil && c.MessageId != nil && !seen[*c.MessageId] {
+			seen[*c.MessageId] = true
+			out = append(out, *c.MessageId)
+		}
+	}
+	return out
+}
+
+func allMessageIDs(updates []acp.SessionUpdate) []string {
+	var out []string
+	for _, u := range updates {
+		switch {
+		case u.AgentMessageChunk != nil && u.AgentMessageChunk.MessageId != nil:
+			out = append(out, *u.AgentMessageChunk.MessageId)
+		case u.AgentThoughtChunk != nil && u.AgentThoughtChunk.MessageId != nil:
+			out = append(out, *u.AgentThoughtChunk.MessageId)
+		case u.UserMessageChunk != nil && u.UserMessageChunk.MessageId != nil:
+			out = append(out, *u.UserMessageChunk.MessageId)
+		}
+	}
+	return out
+}
+
+// Unstable ACP: message ids MUST be UUIDs and identify one message. gc
+// reassembles transcript chunks by messageId, so ids must never repeat
+// across prompts, session/close + session/load, or a restart, and live and
+// replayed ids of the same message must match.
+func TestMessageIDsAreUniqueUUIDsAndStableAcrossReplay(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
+	a.initialize()
+	sid := a.newSession()
+	r1 := a.prompt(sid, "first")
+	live1 := agentMessageIDs(a.client.snapshot())
+	mark := a.client.mark()
+	a.prompt(sid, "second")
+	live2 := agentMessageIDs(a.client.since(mark))
+	if len(live1) != 1 || len(live2) != 1 || live1[0] == live2[0] {
+		t.Fatalf("live ids: first %q second %q", live1, live2)
+	}
+	for _, id := range allMessageIDs(a.client.snapshot()) {
+		if _, err := uuid.Parse(id); err != nil {
+			t.Fatalf("messageId %q is not a UUID", id)
+		}
+	}
+	if r1.UserMessageId == nil {
+		t.Fatal("no userMessageId")
+	}
+	if _, err := uuid.Parse(*r1.UserMessageId); err != nil {
+		t.Fatalf("userMessageId %q is not a UUID", *r1.UserMessageId)
+	}
+
+	if _, err := a.conn.CloseSession(a.ctx(), acp.CloseSessionRequest{SessionId: sid}); err != nil {
+		t.Fatal(err)
+	}
+	mark = a.client.mark()
+	if _, err := a.conn.LoadSession(a.ctx(), acp.LoadSessionRequest{SessionId: sid, Cwd: ws, McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatal(err)
+	}
+	replay := a.client.since(mark)
+	if got := agentMessageIDs(replay); !slices.Equal(got, append(slices.Clone(live1), live2...)) {
+		t.Fatalf("replayed ids %q, live ids %q + %q", got, live1, live2)
+	}
+	var users []string
+	for _, u := range replay {
+		if u.UserMessageChunk != nil && u.UserMessageChunk.MessageId != nil {
+			users = append(users, *u.UserMessageChunk.MessageId)
+		}
+	}
+	if len(users) != 2 || users[0] != *r1.UserMessageId {
+		t.Fatalf("replayed user ids %q, first userMessageId %q", users, *r1.UserMessageId)
+	}
+	mark = a.client.mark()
+	a.prompt(sid, "third")
+	live3 := agentMessageIDs(a.client.since(mark))
+	if len(live3) != 1 || slices.Contains(live1, live3[0]) || slices.Contains(live2, live3[0]) {
+		t.Fatalf("after close+load the id repeats: %q", live3)
+	}
+	a.terminate()
+
+	b := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
+	b.initialize()
+	if _, err := b.conn.ResumeSession(b.ctx(), acp.ResumeSessionRequest{SessionId: sid, Cwd: ws}); err != nil {
+		t.Fatal(err)
+	}
+	b.prompt(sid, "fourth")
+	live4 := agentMessageIDs(b.client.snapshot())
+	if len(live4) != 1 || slices.Contains(append(append(slices.Clone(live1), live2...), live3...), live4[0]) {
+		t.Fatalf("after restart the id repeats: %q", live4)
+	}
+	b.stop()
+}
+
+// A cancelled streaming reply keeps its partial text; it is persisted under
+// the provider's response id, so it replays under the messageId it streamed
+// with.
+func TestCancelledPartialReplaysUnderLiveMessageID(t *testing.T) {
+	llm := newFakeLLM(t)
+	state, ws := newDirs(t)
+	a := startAgent(t, llm, agentOpts{stateDir: state, cwd: ws})
+	a.initialize()
+	sid := a.newSession()
+	done := a.promptAsync(sid, "SLOW please")
+	waitFor(t, 10*time.Second, "streaming", func() bool { _, _, n := messageText(a.client.snapshot()); return n >= 2 })
+	if err := a.conn.Cancel(a.ctx(), acp.CancelNotification{SessionId: sid}); err != nil {
+		t.Fatal(err)
+	}
+	if res := <-done; res.err != nil || res.resp.StopReason != acp.StopReasonCancelled {
+		t.Fatalf("prompt = %+v err=%v", res.resp, res.err)
+	}
+	live := agentMessageIDs(a.client.snapshot())
+	if _, err := a.conn.CloseSession(a.ctx(), acp.CloseSessionRequest{SessionId: sid}); err != nil {
+		t.Fatal(err)
+	}
+	mark := a.client.mark()
+	if _, err := a.conn.LoadSession(a.ctx(), acp.LoadSessionRequest{SessionId: sid, Cwd: ws, McpServers: []acp.McpServer{}}); err != nil {
+		t.Fatal(err)
+	}
+	if replay := agentMessageIDs(a.client.since(mark)); len(live) != 1 || !slices.Equal(replay, live) {
+		t.Fatalf("live ids %q, replayed ids %q", live, replay)
 	}
 	a.stop()
 }

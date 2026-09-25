@@ -196,7 +196,7 @@ type Runtime struct {
 	am              *mirror.Mirror
 	streamedText    map[uint64]bool
 	streamedThought map[uint64]bool
-	textAttempt     map[uint64]int
+	responseKey     map[uint64]string // Gate seq -> response id of the live stream
 	started         map[string]bool
 	reported        map[string]bool
 }
@@ -216,7 +216,7 @@ func Open(parent context.Context, cfg Config, client Client, id session.ID, meta
 		opCall: map[operation.ID]string{}, calls: map[string]llm.ToolCall{}, inputs: map[string]bool{},
 		pgids: map[operation.ID]int{}, cancelledCalls: map[string]bool{},
 		am: mirror.New(), streamedText: map[uint64]bool{}, streamedThought: map[uint64]bool{},
-		textAttempt: map[uint64]int{}, started: map[string]bool{}, reported: map[string]bool{},
+		responseKey: map[uint64]string{}, started: map[string]bool{}, reported: map[string]bool{},
 	}
 	r.ctx, r.cancel = context.WithCancel(parent)
 	fail := func(err error) (*Runtime, error) {
@@ -490,24 +490,15 @@ func submitControl(ctx context.Context, in *inbox.Inbox, message inbox.ControlMe
 	return in.Submit(ctx, inbox.Input{ID: inbox.ID(uuid.New().String()), Kind: inbox.InputControl, Payload: payload})
 }
 
-// ValidInputID reports whether id can be used as an inbox input id.
-func ValidInputID(id string) bool {
-	if id == "" || len(id) > 128 {
-		return false
-	}
-	for _, c := range id {
-		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
-			return false
-		}
-	}
-	return true
-}
-
 // Prompt runs one ACP prompt turn with already-flattened text.
 func (r *Runtime) Prompt(ctx context.Context, text string, messageID *string) (acp.PromptResponse, error) {
+	// ACP message ids are UUIDs; a client-chosen id is kept only if it is
+	// one (it becomes the persisted input id and the replayed messageId).
 	id := uuid.New().String()
-	if messageID != nil && ValidInputID(*messageID) {
-		id = *messageID
+	if messageID != nil {
+		if parsed, err := uuid.Parse(*messageID); err == nil {
+			id = parsed.String()
+		}
 	}
 	deadline := time.Now().Add(10 * time.Second)
 	for {
@@ -832,18 +823,30 @@ func (r *Runtime) projectDelta(d tap.Delta) {
 	}
 	limit := r.cfg.MaxUpdateText
 	switch d.Kind {
+	case tap.Created:
+		// A provider retry announces a new response id, so its text streams
+		// as a new message rather than appending to the failed attempt's.
+		r.responseKey[d.Seq] = d.Text
 	case tap.Text:
-		id := fmt.Sprintf("m-%d", d.Seq)
-		if previous, seen := r.textAttempt[d.Seq]; seen && previous != d.Attempt {
-			r.send(project.AgentText("\n[provider retry]\n", id, limit)...)
-		}
-		r.textAttempt[d.Seq] = d.Attempt
 		r.streamedText[d.Seq] = true
-		r.send(project.AgentText(d.Text, id, limit)...)
+		r.send(project.AgentText(d.Text, r.liveMessageID(d.Seq, project.KindMessage), limit)...)
 	case tap.Thinking:
 		r.streamedThought[d.Seq] = true
-		r.send(project.AgentThought(d.Text, fmt.Sprintf("t-%d", d.Seq), limit)...)
+		r.send(project.AgentThought(d.Text, r.liveMessageID(d.Seq, project.KindThought), limit)...)
 	}
+}
+
+// liveMessageID derives a streamed message's id from the provider response
+// id announced by response.created -- the id the Gate persists -- so the
+// live stream and a later replay agree. A stream that never announced its
+// id gets a random key: still a unique UUID, but replay will differ.
+func (r *Runtime) liveMessageID(seq uint64, kind project.MessageKind) string {
+	key := r.responseKey[seq]
+	if key == "" {
+		key = "unannounced-" + uuid.NewV4().String()
+		r.responseKey[seq] = key
+	}
+	return project.MessageID(string(r.id), key, kind)
 }
 
 func (r *Runtime) projectLive(item sessionstore.Item) {
@@ -856,11 +859,11 @@ func (r *Runtime) projectLive(item sessionstore.Item) {
 			switch data := output.Data.(type) {
 			case llm.Reasoning:
 				if !r.streamedThought[record.Seq] && len(data.Summary) > 0 {
-					r.send(project.AgentThought(strings.Join(data.Summary, "\n\n"), fmt.Sprintf("t-%d", record.Seq), limit)...)
+					r.send(project.AgentThought(strings.Join(data.Summary, "\n\n"), project.MessageID(string(r.id), response.ID, project.KindThought), limit)...)
 				}
 			case llm.Message:
 				if data.Role == llm.RoleAssistant && data.Text != "" && !r.streamedText[record.Seq] {
-					r.send(project.AgentText(data.Text, fmt.Sprintf("m-%d", record.Seq), limit)...)
+					r.send(project.AgentText(data.Text, project.MessageID(string(r.id), response.ID, project.KindMessage), limit)...)
 				}
 			case llm.ToolCall:
 				r.send(project.ToolCallStart(data, limit))
@@ -868,7 +871,7 @@ func (r *Runtime) projectLive(item sessionstore.Item) {
 		}
 		delete(r.streamedText, record.Seq)
 		delete(r.streamedThought, record.Seq)
-		delete(r.textAttempt, record.Seq)
+		delete(r.responseKey, record.Seq)
 		if used := response.Usage.InputTokens + response.Usage.OutputTokens; used > 0 {
 			r.send(acp.SessionUpdate{UsageUpdate: &acp.SessionUsageUpdate{Used: int(used), Size: r.cfg.ContextWindow}})
 		}
@@ -962,7 +965,7 @@ func (r *Runtime) Replay(ctx context.Context) error {
 			return err
 		}
 		for _, item := range page.Items {
-			r.send(project.Replay(item, r.registry, calls, r.cfg.MaxUpdateText)...)
+			r.send(project.Replay(string(r.id), item, r.registry, calls, r.cfg.MaxUpdateText)...)
 		}
 		if !page.More {
 			return nil

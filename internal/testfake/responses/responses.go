@@ -158,6 +158,7 @@ func (f *Fake) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 	id := fmt.Sprintf("resp_%d", n)
+	sse(w, flusher, map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "status": "in_progress", "model": body.Model}})
 
 	command := ""
 	if last.Role == "user" && strings.Contains(lastText, "RUN[") {

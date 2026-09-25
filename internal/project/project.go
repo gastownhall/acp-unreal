@@ -214,7 +214,7 @@ func ToolResult(tools Resolver, call llm.ToolCall, status sessionstore.ToolCallS
 
 // Replay renders one persisted item for session/load. calls indexes every
 // tool call seen so far (Replay adds to it).
-func Replay(item sessionstore.Item, tools Resolver, calls map[string]llm.ToolCall, limit int) []acp.SessionUpdate {
+func Replay(sessionID string, item sessionstore.Item, tools Resolver, calls map[string]llm.ToolCall, limit int) []acp.SessionUpdate {
 	switch item.Kind {
 	case sessionstore.ItemInput:
 		input, _ := item.Data.(inbox.Input)
@@ -233,11 +233,11 @@ func Replay(item sessionstore.Item, tools Resolver, calls map[string]llm.ToolCal
 			switch data := output.Data.(type) {
 			case llm.Reasoning:
 				if len(data.Summary) > 0 {
-					out = append(out, AgentThought(strings.Join(data.Summary, "\n\n"), "t-"+response.ID, limit)...)
+					out = append(out, AgentThought(strings.Join(data.Summary, "\n\n"), MessageID(sessionID, response.ID, KindThought), limit)...)
 				}
 			case llm.Message:
 				if data.Role == llm.RoleAssistant && data.Text != "" {
-					out = append(out, AgentText(data.Text, "m-"+response.ID, limit)...)
+					out = append(out, AgentText(data.Text, MessageID(sessionID, response.ID, KindMessage), limit)...)
 				}
 			case llm.ToolCall:
 				calls[data.CallID] = data

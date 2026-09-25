@@ -31,6 +31,8 @@ const (
 	Thinking
 	ToolStart
 	Model
+	// Created carries the provider's response id (response.created).
+	Created
 )
 
 // Delta is one observed stream event, tagged with the Gate request sequence
@@ -145,6 +147,7 @@ func ParseFrame(frame []byte, emit func(Delta)) {
 			Name   string `json:"name"`
 		} `json:"item"`
 		Response struct {
+			ID    string `json:"id"`
 			Model string `json:"model"`
 		} `json:"response"`
 	}
@@ -163,6 +166,10 @@ func ParseFrame(frame []byte, emit func(Delta)) {
 	case "response.output_item.added":
 		if event.Item.Type == "function_call" {
 			emit(Delta{Kind: ToolStart, CallID: event.Item.CallID, Name: event.Item.Name})
+		}
+	case "response.created":
+		if event.Response.ID != "" {
+			emit(Delta{Kind: Created, Text: event.Response.ID})
 		}
 	case "response.completed", "response.incomplete":
 		if event.Response.Model != "" {
